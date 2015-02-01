@@ -14,6 +14,7 @@
 #include "jit/MIR.h"
 #include "jit/MIRGenerator.h"
 #include "jit/ParallelFunctions.h"
+#include "vm/TraceLogging.h"
 
 #include "jit/IonFrames-inl.h"
 
@@ -41,6 +42,8 @@ CodeGeneratorShared::CodeGeneratorShared(MIRGenerator *gen, LIRGraph *graph, Mac
     gen(gen),
     graph(*graph),
     current(nullptr),
+    snapshots_(),
+    recovers_(),
     deoptTable_(nullptr),
 #ifdef DEBUG
     pushedArgs_(0),
@@ -49,8 +52,7 @@ CodeGeneratorShared::CodeGeneratorShared(MIRGenerator *gen, LIRGraph *graph, Mac
     sps_(&GetIonContext()->runtime->spsProfiler(), &lastPC_),
     osrEntryOffset_(0),
     skipArgCheckEntryOffset_(0),
-    frameDepth_(graph->localSlotCount() * sizeof(STACK_SLOT_SIZE) +
-                graph->argumentSlotCount() * sizeof(Value))
+    frameDepth_(graph->paddedLocalSlotsSize() + graph->argumentsSize())
 {
     if (!gen->compilingAsmJS())
         masm.setInstrumentation(&sps_);
@@ -65,7 +67,7 @@ CodeGeneratorShared::CodeGeneratorShared(MIRGenerator *gen, LIRGraph *graph, Mac
         // An MAsmJSCall does not align the stack pointer at calls sites but instead
         // relies on the a priori stack adjustment (in the prologue) on platforms
         // (like x64) which require the stack to be aligned.
-#ifdef JS_CPU_ARM
+#if defined(JS_CODEGEN_ARM) || defined(JS_CODEGEN_MIPS)
         bool forceAlign = true;
 #else
         bool forceAlign = false;
@@ -92,12 +94,15 @@ CodeGeneratorShared::generateOutOfLineCode()
             return false;
         masm.setFramePushed(outOfLineCode_[i]->framePushed());
         lastPC_ = outOfLineCode_[i]->pc();
+        if (!sps_.prepareForOOL())
+            return false;
         sps_.setPushed(outOfLineCode_[i]->script());
         outOfLineCode_[i]->bind(&masm);
 
         oolIns = outOfLineCode_[i];
         if (!outOfLineCode_[i]->generate(this))
             return false;
+        sps_.finishOOL();
     }
     oolIns = nullptr;
 
@@ -132,32 +137,30 @@ ToStackIndex(LAllocation *a)
 }
 
 bool
-CodeGeneratorShared::encodeSlots(LSnapshot *snapshot, MResumePoint *resumePoint,
-                                 uint32_t *startIndex)
+CodeGeneratorShared::encodeAllocations(LSnapshot *snapshot, MResumePoint *resumePoint,
+                                       uint32_t *startIndex)
 {
     IonSpew(IonSpew_Codegen, "Encoding %u of resume point %p's operands starting from %u",
             resumePoint->numOperands(), (void *) resumePoint, *startIndex);
-    for (uint32_t slotno = 0, e = resumePoint->numOperands(); slotno < e; slotno++) {
-        uint32_t i = slotno + *startIndex;
-        MDefinition *mir = resumePoint->getOperand(slotno);
-
-        if (mir->isPassArg())
-            mir = mir->toPassArg()->getArgument();
-        JS_ASSERT(!mir->isPassArg());
+    for (uint32_t allocno = 0, e = resumePoint->numOperands(); allocno < e; allocno++) {
+        uint32_t i = allocno + *startIndex;
+        MDefinition *mir = resumePoint->getOperand(allocno);
 
         if (mir->isBox())
             mir = mir->toBox()->getOperand(0);
 
         MIRType type = mir->isUnused()
-                       ? MIRType_Undefined
+                       ? MIRType_MagicOptimizedOut
                        : mir->type();
+
+        RValueAllocation alloc;
 
         switch (type) {
           case MIRType_Undefined:
-            snapshots_.addUndefinedSlot();
+            alloc = RValueAllocation::Undefined();
             break;
           case MIRType_Null:
-            snapshots_.addNullSlot();
+            alloc = RValueAllocation::Null();
             break;
           case MIRType_Int32:
           case MIRType_String:
@@ -170,39 +173,37 @@ CodeGeneratorShared::encodeSlots(LSnapshot *snapshot, MResumePoint *resumePoint,
             JSValueType valueType = ValueTypeFromMIRType(type);
             if (payload->isMemory()) {
                 if (type == MIRType_Float32)
-                    snapshots_.addFloat32Slot(ToStackIndex(payload));
+                    alloc = RValueAllocation::Float32(ToStackIndex(payload));
                 else
-                    snapshots_.addSlot(valueType, ToStackIndex(payload));
+                    alloc = RValueAllocation::Typed(valueType, ToStackIndex(payload));
             } else if (payload->isGeneralReg()) {
-                snapshots_.addSlot(valueType, ToRegister(payload));
+                alloc = RValueAllocation::Typed(valueType, ToRegister(payload));
             } else if (payload->isFloatReg()) {
                 FloatRegister reg = ToFloatRegister(payload);
                 if (type == MIRType_Float32)
-                    snapshots_.addFloat32Slot(reg);
+                    alloc = RValueAllocation::Float32(reg);
                 else
-                    snapshots_.addSlot(reg);
+                    alloc = RValueAllocation::Double(reg);
             } else {
                 MConstant *constant = mir->toConstant();
-                const Value &v = constant->value();
-
-                // Don't bother with the constant pool for smallish integers.
-                if (v.isInt32() && v.toInt32() >= -32 && v.toInt32() <= 32) {
-                    snapshots_.addInt32Slot(v.toInt32());
-                } else {
-                    uint32_t index;
-                    if (!graph.addConstantToPool(constant->value(), &index))
-                        return false;
-                    snapshots_.addConstantPoolSlot(index);
-                }
+                uint32_t index;
+                if (!graph.addConstantToPool(constant->value(), &index))
+                    return false;
+                alloc = RValueAllocation::ConstantPool(index);
             }
             break;
           }
-          case MIRType_Magic:
+          case MIRType_MagicOptimizedArguments:
+          case MIRType_MagicOptimizedOut:
           {
             uint32_t index;
-            if (!graph.addConstantToPool(MagicValue(JS_OPTIMIZED_ARGUMENTS), &index))
+            JSWhyMagic why = (type == MIRType_MagicOptimizedArguments
+                              ? JS_OPTIMIZED_ARGUMENTS
+                              : JS_OPTIMIZED_OUT);
+            Value v = MagicValue(why);
+            if (!graph.addConstantToPool(v, &index))
                 return false;
-            snapshots_.addConstantPoolSlot(index);
+            alloc = RValueAllocation::ConstantPool(index);
             break;
           }
           default:
@@ -213,28 +214,59 @@ CodeGeneratorShared::encodeSlots(LSnapshot *snapshot, MResumePoint *resumePoint,
             LAllocation *type = snapshot->typeOfSlot(i);
             if (type->isRegister()) {
                 if (payload->isRegister())
-                    snapshots_.addSlot(ToRegister(type), ToRegister(payload));
+                    alloc = RValueAllocation::Untyped(ToRegister(type), ToRegister(payload));
                 else
-                    snapshots_.addSlot(ToRegister(type), ToStackIndex(payload));
+                    alloc = RValueAllocation::Untyped(ToRegister(type), ToStackIndex(payload));
             } else {
                 if (payload->isRegister())
-                    snapshots_.addSlot(ToStackIndex(type), ToRegister(payload));
+                    alloc = RValueAllocation::Untyped(ToStackIndex(type), ToRegister(payload));
                 else
-                    snapshots_.addSlot(ToStackIndex(type), ToStackIndex(payload));
+                    alloc = RValueAllocation::Untyped(ToStackIndex(type), ToStackIndex(payload));
             }
 #elif JS_PUNBOX64
             if (payload->isRegister())
-                snapshots_.addSlot(ToRegister(payload));
+                alloc = RValueAllocation::Untyped(ToRegister(payload));
             else
-                snapshots_.addSlot(ToStackIndex(payload));
+                alloc = RValueAllocation::Untyped(ToStackIndex(payload));
 #endif
             break;
           }
-      }
+        }
+
+        snapshots_.add(alloc);
     }
 
     *startIndex += resumePoint->numOperands();
     return true;
+}
+
+bool
+CodeGeneratorShared::encode(LRecoverInfo *recover)
+{
+    if (recover->recoverOffset() != INVALID_RECOVER_OFFSET)
+        return true;
+
+    uint32_t frameCount = recover->mir()->frameCount();
+    IonSpew(IonSpew_Snapshots, "Encoding LRecoverInfo %p (frameCount %u)",
+            (void *)recover, frameCount);
+
+    MResumePoint::Mode mode = recover->mir()->mode();
+    JS_ASSERT(mode != MResumePoint::Outer);
+    bool resumeAfter = (mode == MResumePoint::ResumeAfter);
+
+    RecoverOffset offset = recovers_.startRecover(frameCount, resumeAfter);
+
+    for (MResumePoint **it = recover->begin(), **end = recover->end();
+         it != end;
+         ++it)
+    {
+        if (!recovers_.writeFrame(*it))
+            return false;
+    }
+
+    recovers_.endRecover();
+    recover->setRecoverOffset(offset);
+    return !recovers_.oom();
 }
 
 bool
@@ -243,104 +275,51 @@ CodeGeneratorShared::encode(LSnapshot *snapshot)
     if (snapshot->snapshotOffset() != INVALID_SNAPSHOT_OFFSET)
         return true;
 
-    uint32_t frameCount = snapshot->mir()->frameCount();
-
-    IonSpew(IonSpew_Snapshots, "Encoding LSnapshot %p (frameCount %u)",
-            (void *)snapshot, frameCount);
-
-    MResumePoint::Mode mode = snapshot->mir()->mode();
-    JS_ASSERT(mode != MResumePoint::Outer);
-    bool resumeAfter = (mode == MResumePoint::ResumeAfter);
-
-    SnapshotOffset offset = snapshots_.startSnapshot(frameCount, snapshot->bailoutKind(),
-                                                     resumeAfter);
-
-    FlattenedMResumePointIter mirOperandIter(snapshot->mir());
-    if (!mirOperandIter.init())
+    LRecoverInfo *recoverInfo = snapshot->recoverInfo();
+    if (!encode(recoverInfo))
         return false;
 
+    RecoverOffset recoverOffset = recoverInfo->recoverOffset();
+    MOZ_ASSERT(recoverOffset != INVALID_RECOVER_OFFSET);
+
+    IonSpew(IonSpew_Snapshots, "Encoding LSnapshot %p (LRecover %p)",
+            (void *)snapshot, (void*) recoverInfo);
+
+    SnapshotOffset offset = snapshots_.startSnapshot(recoverOffset, snapshot->bailoutKind());
+
+#ifdef TRACK_SNAPSHOTS
+    uint32_t pcOpcode = 0;
+    uint32_t lirOpcode = 0;
+    uint32_t lirId = 0;
+    uint32_t mirOpcode = 0;
+    uint32_t mirId = 0;
+
+    if (LInstruction *ins = instruction()) {
+        lirOpcode = ins->op();
+        lirId = ins->id();
+        if (ins->mirRaw()) {
+            mirOpcode = ins->mirRaw()->op();
+            mirId = ins->mirRaw()->id();
+            if (ins->mirRaw()->trackedPc())
+                pcOpcode = *ins->mirRaw()->trackedPc();
+        }
+    }
+    snapshots_.trackSnapshot(pcOpcode, mirOpcode, mirId, lirOpcode, lirId);
+#endif
+
     uint32_t startIndex = 0;
-    for (MResumePoint **it = mirOperandIter.begin(), **end = mirOperandIter.end();
+    for (MResumePoint **it = recoverInfo->begin(), **end = recoverInfo->end();
          it != end;
          ++it)
     {
         MResumePoint *mir = *it;
-        MBasicBlock *block = mir->block();
-        JSFunction *fun = block->info().fun();
-        JSScript *script = block->info().script();
-        jsbytecode *pc = mir->pc();
-        uint32_t exprStack = mir->stackDepth() - block->info().ninvoke();
-        snapshots_.startFrame(fun, script, pc, exprStack);
-
-        // Ensure that all snapshot which are encoded can safely be used for
-        // bailouts.
-        DebugOnly<jsbytecode *> bailPC = pc;
-        if (mir->mode() == MResumePoint::ResumeAfter)
-          bailPC = GetNextPc(pc);
-
-#ifdef DEBUG
-        if (GetIonContext()->cx) {
-            uint32_t stackDepth;
-            bool reachablePC;
-            if (!ReconstructStackDepth(GetIonContext()->cx, script, bailPC, &stackDepth, &reachablePC))
-                return false;
-
-            if (reachablePC) {
-                if (JSOp(*bailPC) == JSOP_FUNCALL) {
-                    // For fun.call(this, ...); the reconstructStackDepth will
-                    // include the this. When inlining that is not included.
-                    // So the exprStackSlots will be one less.
-                    JS_ASSERT(stackDepth - exprStack <= 1);
-                } else if (JSOp(*bailPC) != JSOP_FUNAPPLY &&
-                           !IsGetPropPC(bailPC) && !IsSetPropPC(bailPC))
-                {
-                    // For fun.apply({}, arguments) the reconstructStackDepth will
-                    // have stackdepth 4, but it could be that we inlined the
-                    // funapply. In that case exprStackSlots, will have the real
-                    // arguments in the slots and not be 4.
-
-                    // With accessors, we have different stack depths depending on
-                    // whether or not we inlined the accessor, as the inlined stack
-                    // contains a callee function that should never have been there
-                    // and we might just be capturing an uneventful property site, in
-                    // which case there won't have been any violence.
-                    JS_ASSERT(exprStack == stackDepth);
-                }
-            }
-        }
-#endif
-
-#ifdef TRACK_SNAPSHOTS
-        LInstruction *ins = instruction();
-
-        uint32_t pcOpcode = 0;
-        uint32_t lirOpcode = 0;
-        uint32_t lirId = 0;
-        uint32_t mirOpcode = 0;
-        uint32_t mirId = 0;
-
-        if (ins) {
-            lirOpcode = ins->op();
-            lirId = ins->id();
-            if (ins->mirRaw()) {
-                mirOpcode = ins->mirRaw()->op();
-                mirId = ins->mirRaw()->id();
-                if (ins->mirRaw()->trackedPc())
-                    pcOpcode = *ins->mirRaw()->trackedPc();
-            }
-        }
-        snapshots_.trackFrame(pcOpcode, mirOpcode, mirId, lirOpcode, lirId);
-#endif
-
-        if (!encodeSlots(snapshot, mir, &startIndex))
+        if (!encodeAllocations(snapshot, mir, &startIndex))
             return false;
-        snapshots_.endFrame();
     }
 
+    MOZ_ASSERT(snapshots_.allocWritten() == snapshot->numSlots());
     snapshots_.endSnapshot();
-
     snapshot->setSnapshotOffset(offset);
-
     return !snapshots_.oom();
 }
 
@@ -395,7 +374,7 @@ CodeGeneratorShared::markSafepoint(LInstruction *ins)
 bool
 CodeGeneratorShared::markSafepointAt(uint32_t offset, LInstruction *ins)
 {
-    JS_ASSERT_IF(safepointIndices_.length(),
+    JS_ASSERT_IF(!safepointIndices_.empty(),
                  offset - safepointIndices_.back().displacement() >= sizeof(uint32_t));
     return safepointIndices_.append(SafepointIndex(offset, ins->safepoint()));
 }
@@ -565,11 +544,13 @@ CodeGeneratorShared::verifyOsiPointRegs(LSafepoint *safepoint)
     // before the return address.
     masm.branch32(Assembler::NotEqual, checkRegs, Imm32(1), &failure);
 
-    // Ignore temp registers. Some instructions (like LValueToInt32) modify
+    // Ignore clobbered registers. Some instructions (like LValueToInt32) modify
     // temps after calling into the VM. This is fine because no other
-    // instructions (including this OsiPoint) will depend on them.
+    // instructions (including this OsiPoint) will depend on them. Also
+    // backtracking can also use the same register for an input and an output.
+    // These are marked as clobbered and shouldn't get checked.
     RegisterSet liveRegs = safepoint->liveRegs();
-    liveRegs = RegisterSet::Intersect(liveRegs, RegisterSet::Not(safepoint->tempRegs()));
+    liveRegs = RegisterSet::Intersect(liveRegs, RegisterSet::Not(safepoint->clobberedRegs()));
 
     VerifyOp op(masm, &failure);
     HandleRegisterDump<VerifyOp>(op, masm, liveRegs, scratch, allRegs.getAny());
@@ -603,7 +584,7 @@ CodeGeneratorShared::verifyOsiPointRegs(LSafepoint *safepoint)
 bool
 CodeGeneratorShared::shouldVerifyOsiPointRegs(LSafepoint *safepoint)
 {
-    if (!js_IonOptions.checkOsiPointRegisters)
+    if (!js_JitOptions.checkOsiPointRegisters)
         return false;
 
     if (gen->info().executionMode() != SequentialExecution)
@@ -653,6 +634,11 @@ CodeGeneratorShared::callVM(const VMFunction &fun, LInstruction *ins, const Regi
     }
 #endif
 
+#ifdef JS_TRACE_LOGGING
+    if (!emitTracelogStartEvent(TraceLogger::VM))
+        return false;
+#endif
+
     // Stack is:
     //    ... frame ...
     //    [args]
@@ -662,7 +648,7 @@ CodeGeneratorShared::callVM(const VMFunction &fun, LInstruction *ins, const Regi
 #endif
 
     // Get the wrapper of the VM function.
-    IonCode *wrapper = gen->jitRuntime()->getVMWrapper(fun);
+    JitCode *wrapper = gen->jitRuntime()->getVMWrapper(fun);
     if (!wrapper)
         return false;
 
@@ -692,6 +678,12 @@ CodeGeneratorShared::callVM(const VMFunction &fun, LInstruction *ins, const Regi
     masm.implicitPop(fun.explicitStackSlots() * sizeof(void *) + framePop);
     // Stack is:
     //    ... frame ...
+
+#ifdef JS_TRACE_LOGGING
+    if (!emitTracelogStopEvent(TraceLogger::VM))
+        return false;
+#endif
+
     return true;
 }
 
@@ -764,11 +756,11 @@ CodeGeneratorShared::visitOutOfLineTruncateSlow(OutOfLineTruncateSlow *ool)
 
     if (ool->needFloat32Conversion()) {
         masm.push(src);
-        masm.convertFloatToDouble(src, src);
+        masm.convertFloat32ToDouble(src, src);
     }
 
     masm.setupUnalignedABICall(1, dest);
-    masm.passABIArg(src);
+    masm.passABIArg(src, MoveOp::DOUBLE);
     if (gen->compilingAsmJS())
         masm.callWithABI(AsmJSImm_ToInt32);
     else
@@ -782,6 +774,17 @@ CodeGeneratorShared::visitOutOfLineTruncateSlow(OutOfLineTruncateSlow *ool)
 
     masm.jump(ool->rejoin());
     return true;
+}
+
+bool
+CodeGeneratorShared::omitOverRecursedCheck() const
+{
+    // If the current function makes no calls (which means it isn't recursive)
+    // and it uses only a small amount of stack space, it doesn't need a
+    // stack overflow check. Note that the actual number here is somewhat
+    // arbitrary, and codegen actually uses small bounded amounts of
+    // additional stack space in some cases too.
+    return frameSize() < 64 && !gen->performsCall();
 }
 
 void
@@ -805,8 +808,7 @@ CodeGeneratorShared::emitPreBarrier(Address address, MIRType type)
 void
 CodeGeneratorShared::dropArguments(unsigned argc)
 {
-    for (unsigned i = 0; i < argc; i++)
-        pushedArgumentSlots_.popBack();
+    pushedArgumentSlots_.shrinkBy(argc);
 }
 
 bool
@@ -956,7 +958,7 @@ CodeGeneratorShared::labelForBackedgeWithImplicitCheck(MBasicBlock *mir)
             } else {
                 // The interrupt check should be the first instruction in the
                 // loop header other than the initial label and move groups.
-                JS_ASSERT(iter->isInterruptCheck() || iter->isCheckInterruptPar());
+                JS_ASSERT(iter->isInterruptCheck() || iter->isInterruptCheckPar());
                 return nullptr;
             }
         }
@@ -979,13 +981,14 @@ CodeGeneratorShared::jumpToBlock(MBasicBlock *mir)
         CodeOffsetJump backedge = masm.jumpWithPatch(&rejoin);
         masm.bind(&rejoin);
 
-        if (!patchableBackedges_.append(PatchableBackedgeInfo(backedge, mir->lir()->label(), oolEntry)))
-            MOZ_CRASH();
+        masm.propagateOOM(patchableBackedges_.append(PatchableBackedgeInfo(backedge, mir->lir()->label(), oolEntry)));
     } else {
         masm.jump(mir->lir()->label());
     }
 }
 
+// This function is not used for MIPS. MIPS has branchToBlock.
+#ifndef JS_CODEGEN_MIPS
 void
 CodeGeneratorShared::jumpToBlock(MBasicBlock *mir, Assembler::Condition cond)
 {
@@ -996,12 +999,12 @@ CodeGeneratorShared::jumpToBlock(MBasicBlock *mir, Assembler::Condition cond)
         CodeOffsetJump backedge = masm.jumpWithPatch(&rejoin, cond);
         masm.bind(&rejoin);
 
-        if (!patchableBackedges_.append(PatchableBackedgeInfo(backedge, mir->lir()->label(), oolEntry)))
-            MOZ_CRASH();
+        masm.propagateOOM(patchableBackedges_.append(PatchableBackedgeInfo(backedge, mir->lir()->label(), oolEntry)));
     } else {
         masm.j(cond, mir->lir()->label());
     }
 }
+#endif
 
 size_t
 CodeGeneratorShared::addCacheLocations(const CacheLocationList &locs, size_t *numLocs)
@@ -1019,6 +1022,134 @@ CodeGeneratorShared::addCacheLocations(const CacheLocationList &locs, size_t *nu
     *numLocs = numLocations;
     return firstIndex;
 }
+
+ReciprocalMulConstants
+CodeGeneratorShared::computeDivisionConstants(int d) {
+    // In what follows, d is positive and is not a power of 2.
+    JS_ASSERT(d > 0 && (d & (d - 1)) != 0);
+
+    // Speeding up division by non power-of-2 constants is possible by
+    // calculating, during compilation, a value M such that high-order
+    // bits of M*n correspond to the result of the division. Formally,
+    // we compute values 0 <= M < 2^32 and 0 <= s < 31 such that
+    //         (M * n) >> (32 + s) = floor(n/d)    if n >= 0
+    //         (M * n) >> (32 + s) = ceil(n/d) - 1 if n < 0.
+    // The original presentation of this technique appears in Hacker's
+    // Delight, a book by Henry S. Warren, Jr.. A proof of correctness
+    // for our version follows.
+
+    // Define p = 32 + s, M = ceil(2^p/d), and assume that s satisfies
+    //                     M - 2^p/d <= 2^(s+1)/d.                 (1)
+    // (Observe that s = FloorLog32(d) satisfies this, because in this
+    // case d <= 2^(s+1) and so the RHS of (1) is at least one). Then,
+    //
+    // a) If s <= FloorLog32(d), then M <= 2^32 - 1.
+    // Proof: Indeed, M is monotone in s and, for s = FloorLog32(d),
+    // the inequalities 2^31 > d >= 2^s + 1 readily imply
+    //    2^p / d  = 2^p/(d - 1) * (d - 1)/d
+    //            <= 2^32 * (1 - 1/d) < 2 * (2^31 - 1) = 2^32 - 2.
+    // The claim follows by applying the ceiling function.
+    //
+    // b) For any 0 <= n < 2^31, floor(Mn/2^p) = floor(n/d).
+    // Proof: Put x = floor(Mn/2^p); it's the unique integer for which
+    //                    Mn/2^p - 1 < x <= Mn/2^p.                (2)
+    // Using M >= 2^p/d on the LHS and (1) on the RHS, we get
+    //           n/d - 1 < x <= n/d + n/(2^31 d) < n/d + 1/d.
+    // Since x is an integer, it's not in the interval (n/d, (n+1)/d),
+    // and so n/d - 1 < x <= n/d, which implies x = floor(n/d).
+    //
+    // c) For any -2^31 <= n < 0, floor(Mn/2^p) + 1 = ceil(n/d).
+    // Proof: The proof is similar. Equation (2) holds as above. Using
+    // M > 2^p/d (d isn't a power of 2) on the RHS and (1) on the LHS,
+    //                 n/d + n/(2^31 d) - 1 < x < n/d.
+    // Using n >= -2^31 and summing 1,
+    //                  n/d - 1/d < x + 1 < n/d + 1.
+    // Since x + 1 is an integer, this implies n/d <= x + 1 < n/d + 1.
+    // In other words, x + 1 = ceil(n/d).
+    //
+    // Condition (1) isn't necessary for the existence of M and s with
+    // the properties above. Hacker's Delight provides a slightly less
+    // restrictive condition when d >= 196611, at the cost of a 3-page
+    // proof of correctness.
+
+    // Note that, since d*M - 2^p = d - (2^p)%d, (1) can be written as
+    //                   2^(s+1) >= d - (2^p)%d.
+    // We now compute the least s with this property...
+
+    int32_t shift = 0;
+    while ((int64_t(1) << (shift+1)) + (int64_t(1) << (shift+32)) % d < d)
+        shift++;
+
+    // ...and the corresponding M. This may not fit in a signed 32-bit
+    // integer; we will compute (M - 2^32) * n + (2^32 * n) instead of
+    // M * n if this is the case (cf. item (a) above).
+    ReciprocalMulConstants rmc;
+    rmc.multiplier = int32_t((int64_t(1) << (shift+32))/d + 1);
+    rmc.shiftAmount = shift;
+
+    return rmc;
+}
+
+
+#ifdef JS_TRACE_LOGGING
+
+bool
+CodeGeneratorShared::emitTracelogScript(bool isStart)
+{
+    RegisterSet regs = RegisterSet::Volatile();
+    Register logger = regs.takeGeneral();
+    Register script = regs.takeGeneral();
+
+    masm.Push(logger);
+    masm.Push(script);
+
+    CodeOffsetLabel patchLogger = masm.movWithPatch(ImmPtr(nullptr), logger);
+    if (!patchableTraceLoggers_.append(patchLogger))
+        return false;
+
+    CodeOffsetLabel patchScript = masm.movWithPatch(ImmWord(0), script);
+    if (!patchableTLScripts_.append(patchScript))
+        return false;
+
+    if (isStart)
+        masm.tracelogStart(logger, script);
+    else
+        masm.tracelogStop(logger, script);
+
+    masm.Pop(script);
+    masm.Pop(logger);
+    return true;
+}
+
+bool
+CodeGeneratorShared::emitTracelogTree(bool isStart, uint32_t textId)
+{
+    if (!TraceLogTextIdEnabled(textId))
+        return true;
+
+    RegisterSet regs = RegisterSet::Volatile();
+    Register logger = regs.takeGeneral();
+
+    masm.Push(logger);
+
+    CodeOffsetLabel patchLocation = masm.movWithPatch(ImmPtr(nullptr), logger);
+    if (!patchableTraceLoggers_.append(patchLocation))
+        return false;
+
+    if (isStart) {
+        masm.tracelogStart(logger, textId);
+    } else {
+#ifdef DEBUG
+        masm.tracelogStop(logger, textId);
+#else
+        masm.tracelogStop(logger);
+#endif
+    }
+
+    masm.Pop(logger);
+    return true;
+}
+#endif
 
 } // namespace jit
 } // namespace js

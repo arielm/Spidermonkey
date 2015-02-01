@@ -31,11 +31,13 @@ class CompileRuntime
 
     bool onMainThread();
 
+    js::PerThreadData *mainThread();
+
     // &mainThread.ionTop
     const void *addressOfIonTop();
 
-    // rt->mainThread.ionStackLimit;
-    const void *addressOfIonStackLimit();
+    // rt->mainThread.jitStackLimit;
+    const void *addressOfJitStackLimit();
 
     // &mainThread.ionJSContext
     const void *addressOfJSContext();
@@ -52,6 +54,12 @@ class CompileRuntime
 
     const void *addressOfInterrupt();
 
+#ifdef JS_THREADSAFE
+    const void *addressOfInterruptPar();
+#endif
+
+    const void *addressOfThreadPool();
+
     const JitRuntime *jitRuntime();
 
     // Compilation does not occur off thread when the SPS profiler is enabled.
@@ -66,7 +74,9 @@ class CompileRuntime
     const Value &NaNValue();
     const Value &positiveInfinityValue();
 
+#ifdef DEBUG
     bool isInsideNursery(gc::Cell *cell);
+#endif
 
     // DOM callbacks must be threadsafe (and will hopefully be removed soon).
     const DOMCallbacks *DOMcallbacks();
@@ -109,7 +119,30 @@ class CompileCompartment
     const JitCompartment *jitCompartment();
 
     bool hasObjectMetadataCallback();
+
+    // Mirror CompartmentOptions.
+    void setSingletonsAsValues();
 };
+
+class JitCompileOptions
+{
+  public:
+    JitCompileOptions();
+    JitCompileOptions(JSContext *cx);
+
+    bool cloneSingletons() const {
+        return cloneSingletons_;
+    }
+
+    bool spsSlowAssertionsEnabled() const {
+        return spsSlowAssertionsEnabled_;
+    }
+
+  private:
+    bool cloneSingletons_;
+    bool spsSlowAssertionsEnabled_;
+};
+
 
 } // namespace jit
 } // namespace js

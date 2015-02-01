@@ -98,7 +98,7 @@ struct JSDContext
     void*                   functionHookData;
     JSD_CallHookProc        toplevelHook;
     void*                   toplevelHookData;
-    JSObject*               glob;
+    JS::Heap<JSObject*>     glob;
     JSD_UserCallbacks       userCallbacks;
     void*                   user;
     JSCList                 scripts;
@@ -206,16 +206,16 @@ struct JSDStackFrameInfo
 
 struct JSDValue
 {
-    jsval       val;
-    int        nref;
-    JSCList     props;
-    JSString*   string;
-    JSString*   funName;
-    const char* className;
-    JSDValue*   proto;
-    JSDValue*   parent;
-    JSDValue*   ctor;
-    unsigned       flags;
+    JS::Heap<JS::Value> val;
+    int                 nref;
+    JSCList             props;
+    JS::Heap<JSString*> string;
+    JS::Heap<JSString*> funName;
+    const char*         className;
+    JSDValue*           proto;
+    JSDValue*           parent;
+    JSDValue*           ctor;
+    unsigned            flags;
 };
 
 struct JSDProperty
@@ -734,13 +734,13 @@ extern JSDStaticLock* _jsd_global_lock;
     JS_BEGIN_MACRO                               \
         if(!_jsd_global_lock)                    \
             _jsd_global_lock = jsd_CreateLock(); \
-        JS_ASSERT(_jsd_global_lock);             \
+        MOZ_ASSERT(_jsd_global_lock);            \
         jsd_Lock(_jsd_global_lock);              \
     JS_END_MACRO
 
 #define JSD_UNLOCK()                             \
     JS_BEGIN_MACRO                               \
-        JS_ASSERT(_jsd_global_lock);             \
+        MOZ_ASSERT(_jsd_global_lock);            \
         jsd_Unlock(_jsd_global_lock);            \
     JS_END_MACRO
 

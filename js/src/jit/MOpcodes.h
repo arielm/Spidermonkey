@@ -12,6 +12,7 @@ namespace jit {
 
 #define MIR_OPCODE_LIST(_)                                                  \
     _(Constant)                                                             \
+    _(CloneLiteral)                                                         \
     _(Parameter)                                                            \
     _(Callee)                                                               \
     _(TableSwitch)                                                          \
@@ -37,10 +38,10 @@ namespace jit {
     _(GetArgumentsObjectArg)                                                \
     _(SetArgumentsObjectArg)                                                \
     _(ComputeThis)                                                          \
-    _(PrepareCall)                                                          \
-    _(PassArg)                                                              \
+    _(LoadArrowThis)                                                        \
     _(Call)                                                                 \
     _(ApplyArgs)                                                            \
+    _(ArraySplice)                                                          \
     _(Bail)                                                                 \
     _(AssertFloat32)                                                        \
     _(GetDynamicName)                                                       \
@@ -87,22 +88,27 @@ namespace jit {
     _(TruncateToInt32)                                                      \
     _(ToString)                                                             \
     _(NewSlots)                                                             \
-    _(NewParallelArray)                                                     \
     _(NewArray)                                                             \
     _(NewObject)                                                            \
     _(NewDeclEnvObject)                                                     \
     _(NewCallObject)                                                        \
+    _(NewRunOnceCallObject)                                                 \
     _(NewStringObject)                                                      \
     _(InitElem)                                                             \
     _(InitElemGetterSetter)                                                 \
+    _(MutateProto)                                                          \
     _(InitProp)                                                             \
     _(InitPropGetterSetter)                                                 \
     _(Start)                                                                \
     _(OsrEntry)                                                             \
     _(Nop)                                                                  \
     _(RegExp)                                                               \
+    _(RegExpExec)                                                           \
     _(RegExpTest)                                                           \
+    _(RegExpReplace)                                                        \
+    _(StringReplace)                                                        \
     _(Lambda)                                                               \
+    _(LambdaArrow)                                                          \
     _(ImplicitThis)                                                         \
     _(Slots)                                                                \
     _(Elements)                                                             \
@@ -112,6 +118,7 @@ namespace jit {
     _(LoadSlot)                                                             \
     _(StoreSlot)                                                            \
     _(FunctionEnvironment)                                                  \
+    _(FilterTypeSet)                                                        \
     _(TypeBarrier)                                                          \
     _(MonitorTypes)                                                         \
     _(PostWriteBarrier)                                                     \
@@ -130,9 +137,11 @@ namespace jit {
     _(TypedArrayLength)                                                     \
     _(TypedArrayElements)                                                   \
     _(TypedObjectElements)                                                  \
+    _(SetTypedObjectOffset)                                                 \
     _(InitializedLength)                                                    \
     _(SetInitializedLength)                                                 \
     _(Not)                                                                  \
+    _(NeuterCheck)                                                          \
     _(BoundsCheck)                                                          \
     _(BoundsCheckLower)                                                     \
     _(InArray)                                                              \
@@ -180,12 +189,13 @@ namespace jit {
     _(InstanceOf)                                                           \
     _(CallInstanceOf)                                                       \
     _(InterruptCheck)                                                       \
-    _(FunctionBoundary)                                                     \
+    _(ProfilerStackOp)                                                      \
     _(GetDOMProperty)                                                       \
     _(GetDOMMember)                                                         \
     _(SetDOMProperty)                                                       \
     _(IsCallable)                                                           \
     _(HaveSameClass)                                                        \
+    _(HasClass)                                                              \
     _(AsmJSNeg)                                                             \
     _(AsmJSUnsignedToDouble)                                                \
     _(AsmJSUnsignedToFloat32)                                               \
@@ -200,7 +210,6 @@ namespace jit {
     _(AsmJSVoidReturn)                                                      \
     _(AsmJSPassStackArg)                                                    \
     _(AsmJSCall)                                                            \
-    _(AsmJSCheckOverRecursed)                                               \
     _(CheckOverRecursedPar)                                                 \
     _(NewCallObjectPar)                                                     \
     _(NewPar)                                                               \
@@ -209,9 +218,11 @@ namespace jit {
     _(AbortPar)                                                             \
     _(LambdaPar)                                                            \
     _(RestPar)                                                              \
-    _(ForkJoinSlice)                                                        \
-    _(GuardThreadLocalObject)                                               \
-    _(CheckInterruptPar)
+    _(ForkJoinContext)                                                      \
+    _(ForkJoinGetSlice)                                                     \
+    _(GuardThreadExclusive)                                                 \
+    _(InterruptCheckPar)                                                    \
+    _(RecompileCheck)
 
 // Forward declarations of MIR types.
 #define FORWARD_DECLARE(op) class M##op;

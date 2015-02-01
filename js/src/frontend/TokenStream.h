@@ -539,7 +539,7 @@ class MOZ_STACK_CLASS TokenStream
     // returns TOK_EOL.  In that case, no token with TOK_EOL is actually
     // created, just a TOK_EOL TokenKind is returned, and currentToken()
     // shouldn't be consulted.  (This is the only place TOK_EOL is produced.)
-    JS_ALWAYS_INLINE TokenKind peekTokenSameLine(Modifier modifier = None) {
+    MOZ_ALWAYS_INLINE TokenKind peekTokenSameLine(Modifier modifier = None) {
        const Token &curr = currentToken();
 
         // If lookahead != 0, we have scanned ahead at least one token, and
@@ -614,7 +614,7 @@ class MOZ_STACK_CLASS TokenStream
     void advance(size_t position);
     void tell(Position *);
     void seek(const Position &pos);
-    void seek(const Position &pos, const TokenStream &other);
+    bool seek(const Position &pos, const TokenStream &other);
 
     size_t positionToOffset(const Position &pos) const {
         return pos.buf - userbuf.base();
@@ -628,12 +628,12 @@ class MOZ_STACK_CLASS TokenStream
         return userbuf.limit();
     }
 
-    bool hasSourceURL() const {
-        return sourceURL_ != nullptr;
+    bool hasDisplayURL() const {
+        return displayURL_ != nullptr;
     }
 
-    jschar *sourceURL() {
-        return sourceURL_;
+    jschar *displayURL() {
+        return displayURL_;
     }
 
     bool hasSourceMapURL() const {
@@ -710,7 +710,7 @@ class MOZ_STACK_CLASS TokenStream
         SourceCoords(ExclusiveContext *cx, uint32_t ln);
 
         void add(uint32_t lineNum, uint32_t lineStartOffset);
-        void fill(const SourceCoords &other);
+        bool fill(const SourceCoords &other);
 
         bool isOnThisLine(uint32_t offset, uint32_t lineNum) const {
             uint32_t lineIndex = lineNumToIndex(lineNum);
@@ -747,8 +747,7 @@ class MOZ_STACK_CLASS TokenStream
     class TokenBuf {
       public:
         TokenBuf(ExclusiveContext *cx, const jschar *buf, size_t length)
-          : base_(buf), limit_(buf + length), ptr(buf),
-            skipBase(cx, &base_), skipLimit(cx, &limit_), skipPtr(cx, &ptr)
+          : base_(buf), limit_(buf + length), ptr(buf)
         { }
 
         bool hasRawChars() const {
@@ -816,7 +815,7 @@ class MOZ_STACK_CLASS TokenStream
 #endif
 
         static bool isRawEOLChar(int32_t c) {
-            return (c == '\n' || c == '\r' || c == LINE_SEPARATOR || c == PARA_SEPARATOR);
+            return c == '\n' || c == '\r' || c == LINE_SEPARATOR || c == PARA_SEPARATOR;
         }
 
         // Finds the next EOL, but stops once 'max' jschars have been scanned
@@ -827,9 +826,6 @@ class MOZ_STACK_CLASS TokenStream
         const jschar *base_;            // base of buffer
         const jschar *limit_;           // limit for quick bounds check
         const jschar *ptr;              // next char to get
-
-        // We are not yet moving strings
-        SkipRoot skipBase, skipLimit, skipPtr;
     };
 
     TokenKind getTokenInternal(Modifier modifier);
@@ -848,13 +844,13 @@ class MOZ_STACK_CLASS TokenStream
     bool getDirective(bool isMultiline, bool shouldWarnDeprecated,
                       const char *directive, int directiveLength,
                       const char *errorMsgPragma, jschar **destination);
-    bool getSourceURL(bool isMultiline, bool shouldWarnDeprecated);
+    bool getDisplayURL(bool isMultiline, bool shouldWarnDeprecated);
     bool getSourceMappingURL(bool isMultiline, bool shouldWarnDeprecated);
 
     // |expect| cannot be an EOL char.
     bool matchChar(int32_t expect) {
         MOZ_ASSERT(!TokenBuf::isRawEOLChar(expect));
-        return JS_LIKELY(userbuf.hasRawChars()) &&
+        return MOZ_LIKELY(userbuf.hasRawChars()) &&
                userbuf.matchRawChar(expect);
     }
 
@@ -889,7 +885,7 @@ class MOZ_STACK_CLASS TokenStream
     const jschar        *prevLinebase;      // start of previous line;  nullptr if on the first line
     TokenBuf            userbuf;            // user input buffer
     const char          *filename;          // input filename or null
-    jschar              *sourceURL_;        // the user's requested source URL or null
+    jschar              *displayURL_;       // the user's requested source URL or null
     jschar              *sourceMapURL_;     // source map's filename or null
     CharBuffer          tokenbuf;           // current token string buffer
     bool                maybeEOL[256];      // probabilistic EOL lookup table
@@ -898,15 +894,6 @@ class MOZ_STACK_CLASS TokenStream
     ExclusiveContext    *const cx;
     JSPrincipals        *const originPrincipals;
     StrictModeGetter    *strictModeGetter;  // used to test for strict mode
-
-    // The tokens array stores pointers to JSAtoms. These are rooted by the
-    // atoms table using AutoKeepAtoms in the Parser. This SkipRoot tells the
-    // exact rooting analysis to ignore the atoms in the tokens array.
-    SkipRoot            tokenSkip;
-
-    // Bug 846011
-    SkipRoot            linebaseSkip;
-    SkipRoot            prevLinebaseSkip;
 };
 
 // Steal one JSREPORT_* bit (see jsapi.h) to tell that arguments to the error

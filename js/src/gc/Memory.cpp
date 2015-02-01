@@ -60,11 +60,12 @@ gc::MapAlignedPages(JSRuntime *rt, size_t size, size_t alignment)
          * Since we're going to unmap the whole thing anyway, the first
          * mapping doesn't have to commit pages.
          */
-        p = VirtualAlloc(nullptr, size * 2, MEM_RESERVE, PAGE_READWRITE);
+        size_t reserveSize = size + alignment - rt->gcSystemPageSize;
+        p = VirtualAlloc(nullptr, reserveSize, MEM_RESERVE, PAGE_READWRITE);
         if (!p)
             return nullptr;
         void *chunkStart = (void *)AlignBytes(uintptr_t(p), alignment);
-        UnmapPages(rt, p, size * 2);
+        UnmapPages(rt, p, reserveSize);
         p = VirtualAlloc(chunkStart, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
         /* Failure here indicates a race with another thread, so try again. */
@@ -107,136 +108,18 @@ gc::GetPageFaultCount()
     return pmc.PageFaultCount;
 }
 
-#elif defined(XP_OS2)
-
-#define INCL_DOSMEMMGR
-#include <os2.h>
-
-#define JS_GC_HAS_MAP_ALIGN 1
-#define OS2_MAX_RECURSIONS  16
-
-void
-gc::InitMemorySubsystem(JSRuntime *rt)
-{
-    rt->gcSystemPageSize = rt->gcSystemAllocGranularity = ArenaSize;
-}
-
-void
-gc::UnmapPages(JSRuntime *rt, void *addr, size_t size)
-{
-    if (!DosFreeMem(addr))
-        return;
-
-    /*
-     * If DosFreeMem() failed, 'addr' is probably part of an "expensive"
-     * allocation, so calculate the base address and try again.
-     */
-    unsigned long cb = 2 * size;
-    unsigned long flags;
-    if (DosQueryMem(addr, &cb, &flags) || cb < size)
-        return;
-
-    uintptr_t base = reinterpret_cast<uintptr_t>(addr) - ((2 * size) - cb);
-    DosFreeMem(reinterpret_cast<void*>(base));
-
-    return;
-}
-
-static void *
-MapAlignedPagesRecursively(JSRuntime *rt, size_t size, size_t alignment, int& recursions)
-{
-    if (++recursions >= OS2_MAX_RECURSIONS)
-        return nullptr;
-
-    void *tmp;
-    if (DosAllocMem(&tmp, size,
-                    OBJ_ANY | PAG_COMMIT | PAG_READ | PAG_WRITE)) {
-        JS_ALWAYS_TRUE(DosAllocMem(&tmp, size,
-                                   PAG_COMMIT | PAG_READ | PAG_WRITE) == 0);
-    }
-    size_t offset = reinterpret_cast<uintptr_t>(tmp) & (alignment - 1);
-    if (!offset)
-        return tmp;
-
-    /*
-     * If there are 'filler' bytes of free space above 'tmp', free 'tmp',
-     * then reallocate it as a 'filler'-sized block;  assuming we're not
-     * in a race with another thread, the next recursion should succeed.
-     */
-    size_t filler = size + alignment - offset;
-    unsigned long cb = filler;
-    unsigned long flags = 0;
-    unsigned long rc = DosQueryMem(&(static_cast<char*>(tmp))[size],
-                                   &cb, &flags);
-    if (!rc && (flags & PAG_FREE) && cb >= filler) {
-        UnmapPages(rt, tmp, 0);
-        if (DosAllocMem(&tmp, filler,
-                        OBJ_ANY | PAG_COMMIT | PAG_READ | PAG_WRITE)) {
-            JS_ALWAYS_TRUE(DosAllocMem(&tmp, filler,
-                                       PAG_COMMIT | PAG_READ | PAG_WRITE) == 0);
-        }
-    }
-
-    void *p = MapAlignedPagesRecursively(rt, size, alignment, recursions);
-    UnmapPages(rt, tmp, 0);
-
-    return p;
-}
-
 void *
-gc::MapAlignedPages(JSRuntime *rt, size_t size, size_t alignment)
+gc::AllocateMappedContent(int fd, size_t offset, size_t length, size_t alignment)
 {
-    JS_ASSERT(size >= alignment);
-    JS_ASSERT(size % alignment == 0);
-    JS_ASSERT(size % rt->gcSystemPageSize == 0);
-    JS_ASSERT(alignment % rt->gcSystemAllocGranularity == 0);
-
-    int recursions = -1;
-
-    /*
-     * Make up to OS2_MAX_RECURSIONS attempts to get an aligned block
-     * of the right size by recursively allocating blocks of unaligned
-     * free memory until only an aligned allocation is possible.
-     */
-    void *p = MapAlignedPagesRecursively(rt, size, alignment, recursions);
-    if (p)
-        return p;
-
-    /*
-     * If memory is heavily fragmented, the recursive strategy may fail;
-     * instead, use the "expensive" strategy:  allocate twice as much
-     * as requested and return an aligned address within this block.
-     */
-    if (DosAllocMem(&p, 2 * size,
-                    OBJ_ANY | PAG_COMMIT | PAG_READ | PAG_WRITE)) {
-        JS_ALWAYS_TRUE(DosAllocMem(&p, 2 * size,
-                                   PAG_COMMIT | PAG_READ | PAG_WRITE) == 0);
-    }
-
-    uintptr_t addr = reinterpret_cast<uintptr_t>(p);
-    addr = (addr + (alignment - 1)) & ~(alignment - 1);
-
-    return reinterpret_cast<void *>(addr);
+    // TODO: Bug 988813 - Support memory mapped array buffer for Windows platform.
+    return nullptr;
 }
 
-bool
-gc::MarkPagesUnused(JSRuntime *rt, void *p, size_t size)
+// Deallocate mapped memory for object.
+void
+gc::DeallocateMappedContent(void *p, size_t length)
 {
-    JS_ASSERT(uintptr_t(p) % rt->gcSystemPageSize == 0);
-    return true;
-}
-
-bool
-gc::MarkPagesInUse(JSRuntime *rt, void *p, size_t size)
-{
-    JS_ASSERT(uintptr_t(p) % rt->gcSystemPageSize == 0);
-    return true;
-}
-
-size_t
-gc::GetPageFaultCount()
-{
-    return 0;
+    // TODO: Bug 988813 - Support memory mapped array buffer for Windows platform.
 }
 
 #elif defined(SOLARIS)
@@ -297,10 +180,27 @@ gc::GetPageFaultCount()
     return 0;
 }
 
+void *
+gc::AllocateMappedContent(int fd, size_t offset, size_t length, size_t alignment)
+{
+    // Not implemented.
+    return nullptr;
+}
+
+// Deallocate mapped memory for object.
+void
+gc::DeallocateMappedContent(void *p, size_t length)
+{
+    // Not implemented.
+}
+
 #elif defined(XP_UNIX)
 
+#include <algorithm>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 void
@@ -415,6 +315,67 @@ gc::GetPageFaultCount()
     if (err)
         return 0;
     return usage.ru_majflt;
+}
+
+void *
+gc::AllocateMappedContent(int fd, size_t offset, size_t length, size_t alignment)
+{
+#define NEED_PAGE_ALIGNED 0
+    size_t pa_start; // Page aligned starting
+    size_t pa_end; // Page aligned ending
+    size_t pa_size; // Total page aligned size
+    size_t page_size = sysconf(_SC_PAGESIZE); // Page size
+    struct stat st;
+    uint8_t *buf;
+
+    // Make sure file exists and do sanity check for offset and size.
+    if (fstat(fd, &st) < 0 || offset >= (size_t) st.st_size ||
+        length == 0 || length > (size_t) st.st_size - offset)
+        return nullptr;
+
+    // Check for minimal alignment requirement.
+#if NEED_PAGE_ALIGNED
+    alignment = std::max(alignment, page_size);
+#endif
+    if (offset & (alignment - 1))
+        return nullptr;
+
+    // Page aligned starting of the offset.
+    pa_start = offset & ~(page_size - 1);
+    // Calculate page aligned ending by adding one page to the page aligned
+    // starting of data end position(offset + length - 1).
+    pa_end = ((offset + length - 1) & ~(page_size - 1)) + page_size;
+    pa_size = pa_end - pa_start;
+
+    // Ask for a continuous memory location.
+    buf = (uint8_t *) MapMemory(pa_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (buf == MAP_FAILED)
+        return nullptr;
+
+    buf = (uint8_t *) mmap(buf, pa_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_FIXED, fd, pa_start);
+    if (buf == MAP_FAILED)
+        return nullptr;
+
+    // Reset the data before target file, which we don't need to see.
+    memset(buf, 0, offset - pa_start);
+
+    // Reset the data after target file, which we don't need to see.
+    memset(buf + (offset - pa_start) + length, 0, pa_end - (offset + length));
+
+    return buf + (offset - pa_start);
+}
+
+void
+gc::DeallocateMappedContent(void *p, size_t length)
+{
+    void *pa_start; // Page aligned starting
+    size_t page_size = sysconf(_SC_PAGESIZE); // Page size
+    size_t total_size; // Total allocated size
+
+    pa_start = (void *)(uintptr_t(p) & ~(page_size - 1));
+    total_size = ((uintptr_t(p) + length) & ~(page_size - 1)) + page_size - uintptr_t(pa_start);
+    munmap(pa_start, total_size);
 }
 
 #else

@@ -24,7 +24,6 @@ using namespace js::gc;
 JS::Zone::Zone(JSRuntime *rt)
   : JS::shadow::Zone(rt, &rt->gcMarker),
     allocator(this),
-    hold(false),
     ionUsingBarriers_(false),
     active(false),
     gcScheduled(false),
@@ -42,6 +41,9 @@ JS::Zone::Zone(JSRuntime *rt)
     gcGrayRoots(),
     data(nullptr),
     types(this)
+#ifdef JS_ION
+    , jitZone_(nullptr)
+#endif
 {
     /* Ensure that there are no vtables to mess us up here. */
     JS_ASSERT(reinterpret_cast<JS::shadow::Zone *>(this) ==
@@ -54,13 +56,10 @@ Zone::~Zone()
 {
     if (this == runtimeFromMainThread()->systemZone)
         runtimeFromMainThread()->systemZone = nullptr;
-}
 
-bool
-Zone::init(JSContext *cx)
-{
-    types.init(cx);
-    return true;
+#ifdef JS_ION
+    js_delete(jitZone_);
+#endif
 }
 
 void
@@ -78,35 +77,6 @@ Zone::setNeedsBarrier(bool needs, ShouldUpdateIon updateIon)
 
     JS_ASSERT_IF(needs, canCollect());
     needsBarrier_ = needs;
-}
-
-void
-Zone::markTypes(JSTracer *trc)
-{
-    /*
-     * Mark all scripts, type objects and singleton JS objects in the
-     * compartment. These can be referred to directly by type sets, which we
-     * cannot modify while code which depends on these type sets is active.
-     */
-    JS_ASSERT(isPreservingCode());
-
-    for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
-        JSScript *script = i.get<JSScript>();
-        MarkScriptRoot(trc, &script, "mark_types_script");
-        JS_ASSERT(script == i.get<JSScript>());
-    }
-
-    for (size_t thingKind = FINALIZE_OBJECT0; thingKind < FINALIZE_OBJECT_LIMIT; thingKind++) {
-        ArenaHeader *aheader = allocator.arenas.getFirstArena(static_cast<AllocKind>(thingKind));
-        if (aheader)
-            trc->runtime->gcMarker.pushArenaList(aheader);
-    }
-
-    for (CellIterUnderGC i(this, FINALIZE_TYPE_OBJECT); !i.done(); i.next()) {
-        types::TypeObject *type = i.get<types::TypeObject>();
-        MarkTypeObjectRoot(trc, &type, "mark_types_scan");
-        JS_ASSERT(type == i.get<types::TypeObject>());
-    }
 }
 
 void
@@ -135,7 +105,7 @@ Zone::onTooMuchMalloc()
 }
 
 void
-Zone::sweep(FreeOp *fop, bool releaseTypes)
+Zone::sweep(FreeOp *fop, bool releaseTypes, bool *oom)
 {
     /*
      * Periodically release observed types for all scripts. This is safe to
@@ -144,9 +114,9 @@ Zone::sweep(FreeOp *fop, bool releaseTypes)
     if (active)
         releaseTypes = false;
 
-    if (!isPreservingCode()) {
+    {
         gcstats::AutoPhase ap(fop->runtime()->gcStats, gcstats::PHASE_DISCARD_ANALYSIS);
-        types.sweep(fop, releaseTypes);
+        types.sweep(fop, releaseTypes, oom);
     }
 
     if (!fop->runtime()->debuggerList.isEmpty())
@@ -166,20 +136,28 @@ Zone::sweepBreakpoints(FreeOp *fop)
     gcstats::AutoPhase ap1(fop->runtime()->gcStats, gcstats::PHASE_SWEEP_TABLES);
     gcstats::AutoPhase ap2(fop->runtime()->gcStats, gcstats::PHASE_SWEEP_TABLES_BREAKPOINT);
 
+    JS_ASSERT(isGCSweeping());
     for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
         JSScript *script = i.get<JSScript>();
+        JS_ASSERT(script->zone()->isGCSweeping());
         if (!script->hasAnyBreakpointsOrStepMode())
             continue;
+
         bool scriptGone = IsScriptAboutToBeFinalized(&script);
         JS_ASSERT(script == i.get<JSScript>());
         for (unsigned i = 0; i < script->length(); i++) {
             BreakpointSite *site = script->getBreakpointSite(script->offsetToPC(i));
             if (!site)
                 continue;
+
             Breakpoint *nextbp;
             for (Breakpoint *bp = site->firstBreakpoint(); bp; bp = nextbp) {
                 nextbp = bp->nextInSite();
-                if (scriptGone || IsObjectAboutToBeFinalized(&bp->debugger->toJSObjectRef()))
+                HeapPtrObject& dbgobj = bp->debugger->toJSObjectRef();
+                JS_ASSERT(dbgobj->zone()->isGCSweeping());
+                bool dying = scriptGone || IsObjectAboutToBeFinalized(&dbgobj);
+                JS_ASSERT_IF(!dying, bp->getHandler()->isMarked());
+                if (dying)
                     bp->destroy(fop);
             }
         }
@@ -190,6 +168,9 @@ void
 Zone::discardJitCode(FreeOp *fop)
 {
 #ifdef JS_ION
+    if (!jitZone())
+        return;
+
     if (isPreservingCode()) {
         PurgeJITCaches(this);
     } else {
@@ -210,7 +191,19 @@ Zone::discardJitCode(FreeOp *fop)
 
         for (CellIterUnderGC i(this, FINALIZE_SCRIPT); !i.done(); i.next()) {
             JSScript *script = i.get<JSScript>();
-            jit::FinishInvalidation(fop, script);
+            jit::FinishInvalidation<SequentialExecution>(fop, script);
+
+            // Preserve JIT code that have been recently used in
+            // parallel. Note that we mark their baseline scripts as active as
+            // well to preserve them.
+            if (script->hasParallelIonScript()) {
+                if (jit::ShouldPreserveParallelJITCode(runtimeFromMainThread(), script)) {
+                    script->parallelIonScript()->purgeCaches();
+                    script->baselineScript()->setActive();
+                } else {
+                    jit::FinishInvalidation<ParallelExecution>(fop, script);
+                }
+            }
 
             /*
              * Discard baseline script if it's not marked as active. Note that
@@ -226,8 +219,7 @@ Zone::discardJitCode(FreeOp *fop)
             script->resetUseCount();
         }
 
-        for (CompartmentsInZoneIter comp(this); !comp.done(); comp.next())
-            jit::FinishDiscardJitCode(fop, comp);
+        jitZone()->optimizedStubSpace()->free();
     }
 #endif
 }
@@ -239,6 +231,20 @@ Zone::gcNumber()
     // them cannot access the main runtime's gcNumber without racing.
     return usedByExclusiveThread ? 0 : runtimeFromMainThread()->gcNumber;
 }
+
+#ifdef JS_ION
+js::jit::JitZone *
+Zone::createJitZone(JSContext *cx)
+{
+    MOZ_ASSERT(!jitZone_);
+
+    if (!cx->runtime()->getJitRuntime(cx))
+        return nullptr;
+
+    jitZone_ = cx->new_<js::jit::JitZone>();
+    return jitZone_;
+}
+#endif
 
 JS::Zone *
 js::ZoneOfObject(const JSObject &obj)
@@ -252,4 +258,12 @@ js::ZoneOfObjectFromAnyThread(const JSObject &obj)
     return obj.zoneFromAnyThread();
 }
 
-
+bool
+Zone::hasMarkedCompartments()
+{
+    for (CompartmentsInZoneIter comp(this); !comp.done(); comp.next()) {
+        if (comp->marked)
+            return true;
+    }
+    return false;
+}

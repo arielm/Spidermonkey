@@ -3,7 +3,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-import os, posixpath, shlex, shutil, subprocess, sys, traceback
+import math, os, posixpath, shlex, shutil, subprocess, sys, traceback
 
 def add_libdir_to_path():
     from os.path import dirname, exists, join, realpath
@@ -15,6 +15,7 @@ def add_libdir_to_path():
 add_libdir_to_path()
 
 import jittests
+from tests import TBPL_FLAGS
 
 def main(argv):
 
@@ -94,6 +95,12 @@ def main(argv):
     op.add_option('--localLib', dest='local_lib', action='store',
                   type='string',
                   help='The location of libraries to push -- preferably stripped')
+    op.add_option('--repeat', type=int, default=1,
+                  help='Repeat tests the given number of times.')
+    op.add_option('--this-chunk', type=int, default=1,
+                  help='The test chunk to run.')
+    op.add_option('--total-chunks', type=int, default=1,
+                  help='The total number of test chunks.')
 
     options, args = op.parse_args(argv)
     if len(args) < 1:
@@ -157,26 +164,26 @@ def main(argv):
     if not options.run_slow:
         test_list = [ _ for _ in test_list if not _.slow ]
 
+    # If chunking is enabled, determine which tests are part of this chunk.
+    # This code was adapted from testing/mochitest/runtestsremote.py.
+    if options.total_chunks > 1:
+        total_tests = len(test_list)
+        tests_per_chunk = math.ceil(total_tests / float(options.total_chunks))
+        start = int(round((options.this_chunk - 1) * tests_per_chunk))
+        end = int(round(options.this_chunk * tests_per_chunk))
+        test_list = test_list[start:end]
+
     # The full test list is ready. Now create copies for each JIT configuration.
     job_list = []
     if options.tbpl:
         # Running all bits would take forever. Instead, we test a few interesting combinations.
-        flags = [
-            [], # no flags, normal baseline and ion
-            ['--ion-eager'], # implies --baseline-eager
-            ['--ion-eager', '--ion-check-range-analysis', '--no-sse3'],
-            ['--baseline-eager'],
-            ['--baseline-eager', '--no-ti', '--no-fpu'],
-            ['--no-baseline', '--no-ion'],
-            ['--no-baseline', '--no-ion', '--no-ti'],
-        ]
         for test in test_list:
-            for variant in flags:
+            for variant in TBPL_FLAGS:
                 new_test = test.copy()
                 new_test.jitflags.extend(variant)
                 job_list.append(new_test)
     elif options.ion:
-        flags = [['--baseline-eager'], ['--ion-eager']]
+        flags = [['--baseline-eager'], ['--ion-eager', '--ion-parallel-compile=off']]
         for test in test_list:
             for variant in flags:
                 new_test = test.copy()

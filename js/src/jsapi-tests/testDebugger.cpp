@@ -10,6 +10,8 @@
 #include "js/OldDebugAPI.h"
 #include "jsapi-tests/tests.h"
 
+using namespace js;
+
 static int callCounts[2] = {0, 0};
 
 static void *
@@ -123,7 +125,7 @@ ThrowHook(JSContext *cx, JSScript *, jsbytecode *, jsval *rval, void *closure)
     JS::RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
 
     char text[] = "new Error()";
-    jsval _;
+    JS::RootedValue _(cx);
     JS_EvaluateScript(cx, global, text, strlen(text), "", 0, &_);
 
     return JSTRAP_CONTINUE;
@@ -168,7 +170,7 @@ BEGIN_TEST(testDebugger_debuggerObjectVsDebugMode)
          "dbg.onDebuggerStatement = function () { hits++; };\n"
          "debuggee.eval('debugger;');\n"
          "hits;\n",
-         v.address());
+         &v);
     CHECK_SAME(v, JSVAL_ONE);
 
     {
@@ -178,7 +180,7 @@ BEGIN_TEST(testDebugger_debuggerObjectVsDebugMode)
 
     EVAL("debuggee.eval('debugger; debugger; debugger;');\n"
          "hits;\n",
-         v.address());
+         &v);
     CHECK_SAME(v, INT_TO_JSVAL(4));
 
     return true;
@@ -224,14 +226,13 @@ bool testIndirectEval(JS::HandleObject scope, const char *code)
         JSAutoCompartment ae(cx, scope);
         JSString *codestr = JS_NewStringCopyZ(cx, code);
         CHECK(codestr);
-        jsval argv[1] = { STRING_TO_JSVAL(codestr) };
-        JS::AutoArrayRooter rooter(cx, 1, argv);
-        jsval v;
-        CHECK(JS_CallFunctionName(cx, scope, "eval", 1, argv, &v));
+        JS::RootedValue arg(cx, JS::StringValue(codestr));
+        JS::RootedValue v(cx);
+        CHECK(JS_CallFunctionName(cx, scope, "eval", arg, &v));
     }
 
     JS::RootedValue hitsv(cx);
-    EVAL("hits", hitsv.address());
+    EVAL("hits", &hitsv);
     CHECK_SAME(hitsv, INT_TO_JSVAL(1));
     return true;
 }
@@ -254,13 +255,14 @@ BEGIN_TEST(testDebugger_singleStepThrow)
     static bool
     setStepMode(JSContext *cx, unsigned argc, jsval *vp)
     {
-        JS::RootedScript script(cx);
-        JS_DescribeScriptedCaller(cx, &script, nullptr);
-        JS_ASSERT(script);
+        CallArgs args = CallArgsFromVp(argc, vp);
 
+        NonBuiltinScriptFrameIter iter(cx);
+        JS::RootedScript script(cx, iter.script());
         if (!JS_SetSingleStepMode(cx, script, true))
             return false;
-        JS_SET_RVAL(cx, vp, JSVAL_VOID);
+
+        args.rval().set(UndefinedValue());
         return true;
     }
 

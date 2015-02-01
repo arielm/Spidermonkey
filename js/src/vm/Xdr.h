@@ -8,6 +8,7 @@
 #define vm_Xdr_h
 
 #include "mozilla/Endian.h"
+#include "mozilla/TypeTraits.h"
 
 #include "jsatom.h"
 
@@ -22,7 +23,7 @@ namespace js {
  * and saved versions. If deserialization fails, the data should be
  * invalidated if possible.
  */
-static const uint32_t XDR_BYTECODE_VERSION = uint32_t(0xb973c0de - 156);
+static const uint32_t XDR_BYTECODE_VERSION = uint32_t(0xb973c0de - 172);
 
 class XDRBuffer {
   public:
@@ -94,11 +95,10 @@ class XDRState {
     XDRBuffer buf;
 
   protected:
-    JSPrincipals *principals_;
     JSPrincipals *originPrincipals_;
 
     XDRState(JSContext *cx)
-      : buf(cx), principals_(nullptr), originPrincipals_(nullptr) {
+      : buf(cx), originPrincipals_(nullptr) {
     }
 
   public:
@@ -161,6 +161,24 @@ class XDRState {
         return true;
     }
 
+    /*
+     * Use SFINAE to refuse any specialization which is not an enum.  Uses of
+     * this function do not have to specialize the type of the enumerated field
+     * as C++ will extract the parameterized from the argument list.
+     */
+    template <typename T>
+    bool codeEnum32(T *val, typename mozilla::EnableIf<mozilla::IsEnum<T>::value, T>::Type * = NULL)
+    {
+        uint32_t tmp;
+        if (mode == XDR_ENCODE)
+            tmp = *val;
+        if (!codeUint32(&tmp))
+            return false;
+        if (mode == XDR_DECODE)
+            *val = T(tmp);
+        return true;
+    }
+
     bool codeDouble(double *dp) {
         union DoublePun {
             double d;
@@ -210,6 +228,7 @@ class XDRState {
 
     bool codeFunction(JS::MutableHandleObject objp);
     bool codeScript(MutableHandleScript scriptp);
+    bool codeConstValue(MutableHandleValue vp);
 };
 
 class XDREncoder : public XDRState<XDR_ENCODE> {
@@ -236,7 +255,7 @@ class XDREncoder : public XDRState<XDR_ENCODE> {
 class XDRDecoder : public XDRState<XDR_DECODE> {
   public:
     XDRDecoder(JSContext *cx, const void *data, uint32_t length,
-               JSPrincipals *principals, JSPrincipals *originPrincipals);
+               JSPrincipals *originPrincipals);
 
 };
 

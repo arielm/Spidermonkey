@@ -45,6 +45,7 @@ ABIArgGenerator::next(MIRType type)
         current_ = ABIArg(Register::FromCode(intRegIndex_));
         intRegIndex_++;
         break;
+      case MIRType_Float32:
       case MIRType_Double:
         if (floatRegIndex_ == NumFloatArgRegs) {
             static const int align = sizeof(double) - 1;
@@ -362,7 +363,7 @@ InstMovWT::extractImm(Imm16 *imm)
 bool
 InstMovWT::checkImm(Imm16 imm)
 {
-    return (imm.decode() == Imm16(*this).decode());
+    return imm.decode() == Imm16(*this).decode();
 }
 
 void
@@ -373,7 +374,7 @@ InstMovWT::extractDest(Register *dest)
 bool
 InstMovWT::checkDest(Register dest)
 {
-    return (dest == toRD(*this));
+    return dest == toRD(*this);
 }
 
 bool
@@ -540,9 +541,6 @@ Assembler::finish()
     JS_ASSERT(!isFinished);
     isFinished = true;
 
-    for (size_t i = 0; i < jumps_.length(); i++)
-        jumps_[i].fixOffset(m_buffer);
-
     for (unsigned int i = 0; i < tmpDataRelocations_.length(); i++) {
         int offset = tmpDataRelocations_[i].getOffset();
         int real_offset = offset + m_buffer.poolSizeBefore(offset);
@@ -567,7 +565,7 @@ Assembler::executableCopy(uint8_t *buffer)
 {
     JS_ASSERT(isFinished);
     m_buffer.executableCopy(buffer);
-    AutoFlushCache::updateTop((uintptr_t)buffer, m_buffer.size());
+    AutoFlushICache::setRange(uintptr_t(buffer), m_buffer.size());
 }
 
 void
@@ -590,7 +588,7 @@ Assembler::actualIndex(uint32_t idx_) const
 }
 
 uint8_t *
-Assembler::PatchableJumpAddress(IonCode *code, uint32_t pe_)
+Assembler::PatchableJumpAddress(JitCode *code, uint32_t pe_)
 {
     return code->raw() + pe_;
 }
@@ -766,21 +764,21 @@ Assembler::getPtr32Target(Iter *start, Register *dest, RelocStyle *style)
     MOZ_ASSUME_UNREACHABLE("unsupported relocation");
 }
 
-static IonCode *
+static JitCode *
 CodeFromJump(InstructionIterator *jump)
 {
     uint8_t *target = (uint8_t *)Assembler::getCF32Target(jump);
-    return IonCode::FromExecutable(target);
+    return JitCode::FromExecutable(target);
 }
 
 void
-Assembler::TraceJumpRelocations(JSTracer *trc, IonCode *code, CompactBufferReader &reader)
+Assembler::TraceJumpRelocations(JSTracer *trc, JitCode *code, CompactBufferReader &reader)
 {
     RelocationIterator iter(reader);
     while (iter.read()) {
         InstructionIterator institer((Instruction *) (code->raw() + iter.offset()));
-        IonCode *child = CodeFromJump(&institer);
-        MarkIonCodeUnbarriered(trc, &child, "rel32");
+        JitCode *child = CodeFromJump(&institer);
+        MarkJitCodeUnbarriered(trc, &child, "rel32");
     }
 }
 
@@ -811,7 +809,7 @@ TraceDataRelocations(JSTracer *trc, ARMBuffer *buffer,
 
 }
 void
-Assembler::TraceDataRelocations(JSTracer *trc, IonCode *code, CompactBufferReader &reader)
+Assembler::TraceDataRelocations(JSTracer *trc, JitCode *code, CompactBufferReader &reader)
 {
     ::TraceDataRelocations(trc, code->raw(), reader);
 }
@@ -842,10 +840,10 @@ Assembler::trace(JSTracer *trc)
 {
     for (size_t i = 0; i < jumps_.length(); i++) {
         RelativePatch &rp = jumps_[i];
-        if (rp.kind == Relocation::IONCODE) {
-            IonCode *code = IonCode::FromExecutable((uint8_t*)rp.target);
-            MarkIonCodeUnbarriered(trc, &code, "masmrel32");
-            JS_ASSERT(code == IonCode::FromExecutable((uint8_t*)rp.target));
+        if (rp.kind == Relocation::JITCODE) {
+            JitCode *code = JitCode::FromExecutable((uint8_t*)rp.target);
+            MarkJitCodeUnbarriered(trc, &code, "masmrel32");
+            JS_ASSERT(code == JitCode::FromExecutable((uint8_t*)rp.target));
         }
     }
 
@@ -1677,11 +1675,11 @@ Assembler::as_dtm(LoadStore ls, Register rn, uint32_t mask,
 }
 
 BufferOffset
-Assembler::as_Imm32Pool(Register dest, uint32_t value, ARMBuffer::PoolEntry *pe, Condition c)
+Assembler::as_Imm32Pool(Register dest, uint32_t value, Condition c)
 {
     PoolHintPun php;
     php.phd.init(0, c, PoolHintData::poolDTR, dest);
-    return m_buffer.insertEntry(4, (uint8_t*)&php.raw, int32Pool, (uint8_t*)&value, pe);
+    return m_buffer.insertEntry(4, (uint8_t*)&php.raw, int32Pool, (uint8_t*)&value);
 }
 
 void
@@ -1703,7 +1701,6 @@ BufferOffset
 Assembler::as_BranchPool(uint32_t value, RepatchLabel *label, ARMBuffer::PoolEntry *pe, Condition c)
 {
     PoolHintPun php;
-    BufferOffset next = nextOffset();
     php.phd.init(0, c, PoolHintData::poolBranch, pc);
     m_buffer.markNextAsBranch();
     BufferOffset ret = m_buffer.insertEntry(4, (uint8_t*)&php.raw, int32Pool, (uint8_t*)&value, pe);
@@ -1711,20 +1708,20 @@ Assembler::as_BranchPool(uint32_t value, RepatchLabel *label, ARMBuffer::PoolEnt
     // a correct branch.
     if (label->bound()) {
         BufferOffset dest(label);
-        as_b(dest.diffB<BOffImm>(next), c, next);
+        as_b(dest.diffB<BOffImm>(ret), c, ret);
     } else {
-        label->use(next.getOffset());
+        label->use(ret.getOffset());
     }
     return ret;
 }
 
 BufferOffset
-Assembler::as_FImm64Pool(VFPRegister dest, double value, ARMBuffer::PoolEntry *pe, Condition c)
+Assembler::as_FImm64Pool(VFPRegister dest, double value, Condition c)
 {
     JS_ASSERT(dest.isDouble());
     PoolHintPun php;
     php.phd.init(0, c, PoolHintData::poolVDTR, dest);
-    return m_buffer.insertEntry(4, (uint8_t*)&php.raw, doublePool, (uint8_t*)&value, pe);
+    return m_buffer.insertEntry(4, (uint8_t*)&php.raw, doublePool, (uint8_t*)&value);
 }
 
 struct PaddedFloat32
@@ -1735,7 +1732,7 @@ struct PaddedFloat32
 JS_STATIC_ASSERT(sizeof(PaddedFloat32) == sizeof(double));
 
 BufferOffset
-Assembler::as_FImm32Pool(VFPRegister dest, float value, ARMBuffer::PoolEntry *pe, Condition c)
+Assembler::as_FImm32Pool(VFPRegister dest, float value, Condition c)
 {
     /*
      * Insert floats into the double pool as they have the same limitations on
@@ -1746,7 +1743,7 @@ Assembler::as_FImm32Pool(VFPRegister dest, float value, ARMBuffer::PoolEntry *pe
     PoolHintPun php;
     php.phd.init(0, c, PoolHintData::poolVDTR, dest);
     PaddedFloat32 pf = { value, 0 };
-    return m_buffer.insertEntry(4, (uint8_t*)&php.raw, doublePool, (uint8_t*)&pf, pe);
+    return m_buffer.insertEntry(4, (uint8_t*)&php.raw, doublePool, (uint8_t*)&pf);
 }
 
 // Pool callbacks stuff:
@@ -1807,11 +1804,6 @@ Assembler::placeConstantPoolBarrier(int offset)
     // this is still an active path, however, we do not hit it in the test
     // suite at all.
     MOZ_ASSUME_UNREACHABLE("ARMAssembler holdover");
-#if 0
-    offset = (offset - sizeof(ARMWord)) >> 2;
-    ASSERT((offset <= BOFFSET_MAX && offset >= BOFFSET_MIN));
-    return AL | B | (offset & BRANCH_MASK);
-#endif
 }
 
 // Control flow stuff:
@@ -1865,6 +1857,10 @@ Assembler::as_b(Label *l, Condition c, bool isPatchable)
         old = l->offset();
         // This will currently throw an assertion if we couldn't actually
         // encode the offset of the branch.
+        if (!BOffImm::isInRange(old)) {
+            m_buffer.fail_bail();
+            return ret;
+        }
         ret = as_b(BOffImm(old), c, isPatchable);
     } else {
         old = LabelBase::INVALID_OFFSET;
@@ -1923,6 +1919,10 @@ Assembler::as_bl(Label *l, Condition c)
         // This will currently throw an assertion if we couldn't actually
         // encode the offset of the branch.
         old = l->offset();
+        if (!BOffImm::isInRange(old)) {
+            m_buffer.fail_bail();
+            return ret;
+        }
         ret = as_bl(BOffImm(old), c);
     } else {
         old = LabelBase::INVALID_OFFSET;
@@ -2168,7 +2168,7 @@ Assembler::as_vcvtFixed(VFPRegister vd, bool isSigned, uint32_t fixedPoint, bool
     int32_t imm5 = fixedPoint;
     imm5 = (sx ? 32 : 16) - imm5;
     JS_ASSERT(imm5 >= 0);
-    imm5 = imm5 >> 1 | (imm5 & 1) << 6;
+    imm5 = imm5 >> 1 | (imm5 & 1) << 5;
     return writeVFPInst(sf, 0x02BA0040 | VD(vd) | toFixed << 18 | sx << 7 |
                         (!isSigned) << 16 | imm5 | c);
 }
@@ -2412,7 +2412,7 @@ Assembler::retargetNearBranch(Instruction *i, int offset, Condition cond, bool f
 
     // Flush the cache, since an instruction was overwritten
     if (final)
-        AutoFlushCache::updateTop(uintptr_t(i), 4);
+        AutoFlushICache::flush(uintptr_t(i), 4);
 }
 
 void
@@ -2421,7 +2421,7 @@ Assembler::retargetFarBranch(Instruction *i, uint8_t **slot, uint8_t *dest, Cond
     int32_t offset = reinterpret_cast<uint8_t*>(slot) - reinterpret_cast<uint8_t*>(i);
     if (!i->is<InstLDR>()) {
         new (i) InstLDR(Offset, pc, DTRAddr(pc, DtrOffImm(offset - 8)), cond);
-        AutoFlushCache::updateTop(uintptr_t(i), 4);
+        AutoFlushICache::flush(uintptr_t(i), 4);
     }
     *slot = dest;
 
@@ -2523,7 +2523,7 @@ Assembler::patchWrite_NearCall(CodeLocationLabel start, CodeLocationLabel toCall
     new (inst) InstBLImm(BOffImm(dest - (uint8_t*)inst) , Always);
     // Ensure everyone sees the code that was just written into memory.
 
-    AutoFlushCache::updateTop(uintptr_t(inst), 4);
+    AutoFlushICache::flush(uintptr_t(inst), 4);
 
 }
 void
@@ -2540,8 +2540,8 @@ Assembler::patchDataWithValueCheck(CodeLocationLabel label, PatchedImmPtr newVal
                                                                  dest, Always, rs, ptr);
     // L_LDR won't cause any instructions to be updated.
     if (rs != L_LDR) {
-        AutoFlushCache::updateTop(uintptr_t(ptr), 4);
-        AutoFlushCache::updateTop(uintptr_t(ptr->next()), 4);
+        AutoFlushICache::flush(uintptr_t(ptr), 4);
+        AutoFlushICache::flush(uintptr_t(ptr->next()), 4);
     }
 }
 
@@ -2673,7 +2673,7 @@ Assembler::ToggleToJmp(CodeLocationLabel inst_)
     // Zero bits 20-27, then set 24-27 to be correct for a branch.
     // 20-23 will be party of the B's immediate, and should be 0.
     *ptr = (*ptr & ~(0xff << 20)) | (0xa0 << 20);
-    AutoFlushCache::updateTop((uintptr_t)ptr, 4);
+    AutoFlushICache::flush(uintptr_t(ptr), 4);
 }
 
 void
@@ -2696,7 +2696,7 @@ Assembler::ToggleToCmp(CodeLocationLabel inst_)
     // Zero out bits 20-27, then set them to be correct for a compare.
     *ptr = (*ptr & ~(0xff << 20)) | (0x35 << 20);
 
-    AutoFlushCache::updateTop((uintptr_t)ptr, 4);
+    AutoFlushICache::flush(uintptr_t(ptr), 4);
 }
 
 void
@@ -2726,7 +2726,7 @@ Assembler::ToggleCall(CodeLocationLabel inst_, bool enabled)
     else
         *inst = InstNOP();
 
-    AutoFlushCache::updateTop(uintptr_t(inst), 4);
+    AutoFlushICache::flush(uintptr_t(inst), 4);
 }
 
 void Assembler::updateBoundsCheck(uint32_t heapSize, Instruction *inst)
@@ -2748,60 +2748,6 @@ void Assembler::updateBoundsCheck(uint32_t heapSize, Instruction *inst)
     // within AsmJSModule::patchHeapAccesses, which does that for us.  Don't call this!
 }
 
-void
-AutoFlushCache::update(uintptr_t newStart, size_t len)
-{
-    uintptr_t newStop = newStart + len;
-    used_ = true;
-    if (!start_) {
-        IonSpewCont(IonSpew_CacheFlush,  ".");
-        start_ = newStart;
-        stop_ = newStop;
-        return;
-    }
-
-    if (newStop < start_ - 4096 || newStart > stop_ + 4096) {
-        // If this would add too many pages to the range, bail and just do the flush now.
-        IonSpewCont(IonSpew_CacheFlush, "*");
-        JSC::ExecutableAllocator::cacheFlush((void*)newStart, len);
-        return;
-    }
-    start_ = Min(start_, newStart);
-    stop_ = Max(stop_, newStop);
-    IonSpewCont(IonSpew_CacheFlush, ".");
-}
-
-AutoFlushCache::~AutoFlushCache()
-{
-   if (!runtime_)
-        return;
-
-    flushAnyway();
-    IonSpewCont(IonSpew_CacheFlush, ">", name_);
-    if (runtime_->flusher() == this) {
-        IonSpewFin(IonSpew_CacheFlush);
-        runtime_->setFlusher(nullptr);
-    }
-}
-
-void
-AutoFlushCache::flushAnyway()
-{
-    if (!runtime_)
-        return;
-
-    IonSpewCont(IonSpew_CacheFlush, "|", name_);
-
-    if (!used_)
-        return;
-
-    if (start_) {
-        JSC::ExecutableAllocator::cacheFlush((void *)start_, size_t(stop_ - start_ + sizeof(Instruction)));
-    } else {
-        JSC::ExecutableAllocator::cacheFlush(nullptr, 0xff000000);
-    }
-    used_ = false;
-}
 InstructionIterator::InstructionIterator(Instruction *i_) : i(i_) {
     const PoolHeader *ph;
     // If this is a guard, and the next instruction is a header, always work around the pool

@@ -6,15 +6,19 @@
 
 CPP_UNIT_TESTS += [
     'TestAtomics.cpp',
+    'TestBinarySearch.cpp',
     'TestBloomFilter.cpp',
     'TestCasting.cpp',
     'TestCeilingFloor.cpp',
     'TestCheckedInt.cpp',
+    'TestCountPopulation.cpp',
     'TestCountZeroes.cpp',
     'TestEndian.cpp',
     'TestEnumSet.cpp',
     'TestFloatingPoint.cpp',
     'TestIntegerPrintfMacros.cpp',
+    'TestMacroArgs.cpp',
+    'TestMacroForEach.cpp',
     'TestRollingMean.cpp',
     'TestSHA1.cpp',
     'TestTypedEnum.cpp',
@@ -29,3 +33,5 @@ if not CONFIG['MOZ_ASAN']:
 
 # Since we link directly with MFBT object files, define IMPL_MFBT
 DEFINES['IMPL_MFBT'] = True
+
+DISABLE_STL_WRAPPING = True

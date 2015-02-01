@@ -27,6 +27,13 @@ CompileRuntime::onMainThread()
     return js::CurrentThreadCanAccessRuntime(runtime());
 }
 
+js::PerThreadData *
+CompileRuntime::mainThread()
+{
+    JS_ASSERT(onMainThread());
+    return &runtime()->mainThread;
+}
+
 const void *
 CompileRuntime::addressOfIonTop()
 {
@@ -34,15 +41,15 @@ CompileRuntime::addressOfIonTop()
 }
 
 const void *
-CompileRuntime::addressOfIonStackLimit()
+CompileRuntime::addressOfJitStackLimit()
 {
-    return &runtime()->mainThread.ionStackLimit;
+    return &runtime()->mainThread.jitStackLimit;
 }
 
 const void *
 CompileRuntime::addressOfJSContext()
 {
-    return &runtime()->mainThread.ionJSContext;
+    return &runtime()->mainThread.jitJSContext;
 }
 
 const void *
@@ -69,6 +76,20 @@ const void *
 CompileRuntime::addressOfInterrupt()
 {
     return &runtime()->interrupt;
+}
+
+#ifdef JS_THREADSAFE
+const void *
+CompileRuntime::addressOfInterruptPar()
+{
+    return &runtime()->interruptPar;
+}
+#endif
+
+const void *
+CompileRuntime::addressOfThreadPool()
+{
+    return &runtime()->threadPool;
 }
 
 const JitRuntime *
@@ -104,13 +125,13 @@ CompileRuntime::hadOutOfMemory()
 const JSAtomState &
 CompileRuntime::names()
 {
-    return runtime()->atomState;
+    return *runtime()->commonNames;
 }
 
 const StaticStrings &
 CompileRuntime::staticStrings()
 {
-    return runtime()->staticStrings;
+    return *runtime()->staticStrings;
 }
 
 const Value &
@@ -125,11 +146,13 @@ CompileRuntime::positiveInfinityValue()
     return runtime()->positiveInfinityValue;
 }
 
+#ifdef DEBUG
 bool
 CompileRuntime::isInsideNursery(gc::Cell *cell)
 {
     return UninlinedIsInsideNursery(runtime(), cell);
 }
+#endif
 
 const DOMCallbacks *
 CompileRuntime::DOMcallbacks()
@@ -227,4 +250,31 @@ bool
 CompileCompartment::hasObjectMetadataCallback()
 {
     return compartment()->hasObjectMetadataCallback();
+}
+
+// Note: This function is thread-safe because setSingletonAsValue sets a boolean
+// variable to false, and this boolean variable has no way to be resetted to
+// true. So even if there is a concurrent write, this concurrent write will
+// always have the same value.  If there is a concurrent read, then we will
+// clone a singleton instead of using the value which is baked in the JSScript,
+// and this would be an unfortunate allocation, but this will not change the
+// semantics of the JavaScript code which is executed.
+void
+CompileCompartment::setSingletonsAsValues()
+{
+    return JS::CompartmentOptionsRef(compartment()).setSingletonsAsValues();
+}
+
+JitCompileOptions::JitCompileOptions()
+  : cloneSingletons_(false),
+    spsSlowAssertionsEnabled_(false)
+{
+}
+
+JitCompileOptions::JitCompileOptions(JSContext *cx)
+{
+    JS::CompartmentOptions &options = cx->compartment()->options();
+    cloneSingletons_ = options.cloneSingletons(cx);
+    spsSlowAssertionsEnabled_ = cx->runtime()->spsProfiler.enabled() &&
+                                cx->runtime()->spsProfiler.slowAssertionsEnabled();
 }

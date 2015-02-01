@@ -17,6 +17,7 @@ namespace js {
 class ArgumentsObject;
 class ArrayBufferObject;
 class ArrayBufferViewObject;
+class SharedArrayBufferObject;
 class BaseShape;
 class DebugScopeObject;
 struct GCMarker;
@@ -29,7 +30,7 @@ class UnownedBaseShape;
 template<class, typename> class HeapPtr;
 
 namespace jit {
-class IonCode;
+class JitCode;
 class IonScript;
 class VMFunction;
 }
@@ -79,24 +80,33 @@ namespace gc {
  * IsObjectMarked(JSObject **thing);
  *     This function is indended to be used in rare cases in code used to mark
  *     GC things.  It indicates whether the object is currently marked.
+ *
+ * UpdateObjectIfRelocated(JSObject **thingp);
+ *     In some circumstances -- e.g. optional weak marking -- it is necessary
+ *     to look at the pointer before marking it strongly or weakly. In these
+ *     cases, the following must be called to update the pointer before use.
  */
+
 #define DeclMarker(base, type)                                                                    \
-void Mark##base(JSTracer *trc, BarrieredPtr<type> *thing, const char *name);                   \
+void Mark##base(JSTracer *trc, BarrieredPtr<type> *thing, const char *name);                      \
 void Mark##base##Root(JSTracer *trc, type **thingp, const char *name);                            \
 void Mark##base##Unbarriered(JSTracer *trc, type **thingp, const char *name);                     \
 void Mark##base##Range(JSTracer *trc, size_t len, HeapPtr<type> *thing, const char *name);        \
 void Mark##base##RootRange(JSTracer *trc, size_t len, type **thing, const char *name);            \
 bool Is##base##Marked(type **thingp);                                                             \
-bool Is##base##Marked(BarrieredPtr<type> *thingp);                                             \
+bool Is##base##Marked(BarrieredPtr<type> *thingp);                                                \
 bool Is##base##AboutToBeFinalized(type **thingp);                                                 \
-bool Is##base##AboutToBeFinalized(BarrieredPtr<type> *thingp);                                 \
+bool Is##base##AboutToBeFinalized(BarrieredPtr<type> *thingp);                                    \
+type *Update##base##IfRelocated(JSRuntime *rt, BarrieredPtr<type> *thingp);                       \
+type *Update##base##IfRelocated(JSRuntime *rt, type **thingp);
 
 DeclMarker(BaseShape, BaseShape)
 DeclMarker(BaseShape, UnownedBaseShape)
-DeclMarker(IonCode, jit::IonCode)
+DeclMarker(JitCode, jit::JitCode)
 DeclMarker(Object, ArgumentsObject)
 DeclMarker(Object, ArrayBufferObject)
 DeclMarker(Object, ArrayBufferViewObject)
+DeclMarker(Object, SharedArrayBufferObject)
 DeclMarker(Object, DebugScopeObject)
 DeclMarker(Object, GlobalObject)
 DeclMarker(Object, JSObject)
@@ -114,10 +124,13 @@ DeclMarker(TypeObject, types::TypeObject)
 
 #undef DeclMarker
 
+void
+MarkPermanentAtom(JSTracer *trc, JSAtom *atom, const char *name);
+
 /* Return true if the pointer is nullptr, or if it is a tagged pointer to
  * nullptr.
  */
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 IsNullTaggedPointer(void *p)
 {
     return uintptr_t(p) < 32;
@@ -277,9 +290,9 @@ Mark(JSTracer *trc, BarrieredPtrScript *o, const char *name)
 }
 
 inline void
-Mark(JSTracer *trc, HeapPtr<jit::IonCode> *code, const char *name)
+Mark(JSTracer *trc, HeapPtr<jit::JitCode> *code, const char *name)
 {
-    MarkIonCode(trc, code, name);
+    MarkJitCode(trc, code, name);
 }
 
 /* For use by WeakMap's HashKeyRef instantiation. */
@@ -349,16 +362,16 @@ inline bool
 IsAboutToBeFinalized(const js::jit::VMFunction **vmfunc)
 {
     /*
-     * Preserves entries in the WeakCache<VMFunction, IonCode>
-     * iff the IonCode has been marked.
+     * Preserves entries in the WeakCache<VMFunction, JitCode>
+     * iff the JitCode has been marked.
      */
     return true;
 }
 
 inline bool
-IsAboutToBeFinalized(ReadBarriered<js::jit::IonCode> code)
+IsAboutToBeFinalized(ReadBarriered<js::jit::JitCode> code)
 {
-    return IsIonCodeAboutToBeFinalized(code.unsafeGet());
+    return IsJitCodeAboutToBeFinalized(code.unsafeGet());
 }
 #endif
 

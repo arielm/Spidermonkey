@@ -34,6 +34,7 @@ UNIFIED_SOURCES += [
     'testFunctionProperties.cpp',
     'testGCExactRooting.cpp',
     'testGCFinalizeCallback.cpp',
+    'testGCHeapPostBarriers.cpp',
     'testGCOutOfMemory.cpp',
     'testGCStoreBufferRemoval.cpp',
     'testHashTable.cpp',
@@ -42,9 +43,11 @@ UNIFIED_SOURCES += [
     'testIntern.cpp',
     'testIntString.cpp',
     'testIntTypesABI.cpp',
+    'testIsInsideNursery.cpp',
     'testJSEvaluateScript.cpp',
     'testLookup.cpp',
     'testLooselyEqual.cpp',
+    'testMappedArrayBuffer.cpp',
     'testNewObject.cpp',
     'testNullRoot.cpp',
     'testObjectEmulatingUndefined.cpp',
@@ -62,17 +65,27 @@ UNIFIED_SOURCES += [
     'testScriptInfo.cpp',
     'testScriptObject.cpp',
     'testSetProperty.cpp',
+    'testSetPropertyIgnoringNamedGetter.cpp',
     'testSourcePolicy.cpp',
     'testStringBuffer.cpp',
     'testStructuredClone.cpp',
     'testToIntWidth.cpp',
     'testTrap.cpp',
     'testTypedArrays.cpp',
+    'testUncaughtError.cpp',
     'testUTF8.cpp',
     'testXDR.cpp',
 ]
+
+if CONFIG['ENABLE_ION']:
+    UNIFIED_SOURCES += [
+        'testJitRValueAlloc.cpp',
+    ]
 
 DEFINES['EXPORT_JS_API'] = True
 # Building against js_static requires that we declare mfbt sybols "exported"
 # on its behalf.
 DEFINES['IMPL_MFBT'] = True
+
+LOCAL_INCLUDES += ['..']
+GENERATED_INCLUDES += ['..']

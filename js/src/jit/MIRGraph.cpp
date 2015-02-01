@@ -16,20 +16,22 @@
 using namespace js;
 using namespace js::jit;
 
-MIRGenerator::MIRGenerator(CompileCompartment *compartment,
-                           TempAllocator *alloc, MIRGraph *graph, CompileInfo *info)
+MIRGenerator::MIRGenerator(CompileCompartment *compartment, const JitCompileOptions &options,
+                           TempAllocator *alloc, MIRGraph *graph, CompileInfo *info,
+                           const OptimizationInfo *optimizationInfo)
   : compartment(compartment),
     info_(info),
+    optimizationInfo_(optimizationInfo),
     alloc_(alloc),
     graph_(graph),
     error_(false),
-    cancelBuild_(0),
+    cancelBuild_(false),
     maxAsmJSStackArgBytes_(0),
+    performsCall_(false),
     performsAsmJSCall_(false),
-    asmJSHeapAccesses_(*alloc),
-    asmJSGlobalAccesses_(*alloc),
     minAsmJSHeapLength_(AsmJSAllocationGranularity),
-    modifiesFrameArguments_(false)
+    modifiesFrameArguments_(false),
+    options(options)
 { }
 
 bool
@@ -127,34 +129,34 @@ MIRGraph::unmarkBlocks()
 }
 
 MDefinition *
-MIRGraph::forkJoinSlice()
+MIRGraph::forkJoinContext()
 {
-    // Search the entry block to find a par slice instruction.  If we do not
-    // find one, add one after the Start instruction.
+    // Search the entry block to find a ForkJoinContext instruction. If we do
+    // not find one, add one after the Start instruction.
     //
     // Note: the original design used a field in MIRGraph to cache the
-    // forkJoinSlice rather than searching for it again.  However, this could
-    // become out of date due to DCE.  Given that we do not generally have to
-    // search very far to find the par slice instruction if it exists, and
-    // that we don't look for it that often, I opted to simply eliminate the
-    // cache and search anew each time, so that it is that much easier to keep
-    // the IR coherent. - nmatsakis
+    // forkJoinContext rather than searching for it again.  However, this
+    // could become out of date due to DCE.  Given that we do not generally
+    // have to search very far to find the ForkJoinContext instruction if it
+    // exists, and that we don't look for it that often, I opted to simply
+    // eliminate the cache and search anew each time, so that it is that much
+    // easier to keep the IR coherent. - nmatsakis
 
     MBasicBlock *entry = entryBlock();
     JS_ASSERT(entry->info().executionMode() == ParallelExecution);
 
     MInstruction *start = nullptr;
     for (MInstructionIterator ins(entry->begin()); ins != entry->end(); ins++) {
-        if (ins->isForkJoinSlice())
+        if (ins->isForkJoinContext())
             return *ins;
         else if (ins->isStart())
             start = *ins;
     }
     JS_ASSERT(start);
 
-    MForkJoinSlice *slice = MForkJoinSlice::New(alloc());
-    entry->insertAfter(start, slice);
-    return slice;
+    MForkJoinContext *cx = MForkJoinContext::New(alloc());
+    entry->insertAfter(start, cx);
+    return cx;
 }
 
 MBasicBlock *
@@ -208,9 +210,19 @@ MBasicBlock::NewWithResumePoint(MIRGraph &graph, CompileInfo &info,
 
 MBasicBlock *
 MBasicBlock::NewPendingLoopHeader(MIRGraph &graph, CompileInfo &info,
-                                  MBasicBlock *pred, jsbytecode *entryPc)
+                                  MBasicBlock *pred, jsbytecode *entryPc,
+                                  unsigned stackPhiCount)
 {
-    return MBasicBlock::New(graph, nullptr, info, pred, entryPc, PENDING_LOOP_HEADER);
+    JS_ASSERT(entryPc != nullptr);
+
+    MBasicBlock *block = new(graph.alloc()) MBasicBlock(graph, info, entryPc, PENDING_LOOP_HEADER);
+    if (!block->init())
+        return nullptr;
+
+    if (!block->inherit(graph.alloc(), nullptr, pred, 0, stackPhiCount))
+        return nullptr;
+
+    return block;
 }
 
 MBasicBlock *
@@ -252,11 +264,18 @@ MBasicBlock::NewAsmJS(MIRGraph &graph, CompileInfo &info, MBasicBlock *pred, Kin
         block->stackPosition_ = pred->stackPosition_;
 
         if (block->kind_ == PENDING_LOOP_HEADER) {
-            for (size_t i = 0; i < block->stackPosition_; i++) {
+            size_t nphis = block->stackPosition_;
+
+            TempAllocator &alloc = graph.alloc();
+            MPhi *phis = (MPhi*)alloc.allocateArray<sizeof(MPhi)>(nphis);
+            if (!phis)
+                return nullptr;
+
+            for (size_t i = 0; i < nphis; i++) {
                 MDefinition *predSlot = pred->getSlot(i);
 
                 JS_ASSERT(predSlot->type() != MIRType_Value);
-                MPhi *phi = MPhi::New(graph.alloc(), i, predSlot->type());
+                MPhi *phi = new(phis + i) MPhi(alloc, i, predSlot->type());
 
                 JS_ALWAYS_TRUE(phi->reserveLength(2));
                 phi->addInput(predSlot);
@@ -276,7 +295,7 @@ MBasicBlock::NewAsmJS(MIRGraph &graph, CompileInfo &info, MBasicBlock *pred, Kin
 }
 
 MBasicBlock::MBasicBlock(MIRGraph &graph, CompileInfo &info, jsbytecode *pc, Kind kind)
-  : earlyAbort_(false),
+  : unreachable_(false),
     graph_(graph),
     info_(info),
     predecessors_(graph.alloc()),
@@ -294,7 +313,6 @@ MBasicBlock::MBasicBlock(MIRGraph &graph, CompileInfo &info, jsbytecode *pc, Kin
     immediatelyDominated_(graph.alloc()),
     immediateDominator_(nullptr),
     numDominated_(0),
-    loopHeader_(nullptr),
     trackedPc_(pc)
 #if defined (JS_ION_PERF)
     , lineno_(0u),
@@ -315,6 +333,17 @@ MBasicBlock::increaseSlots(size_t num)
     return slots_.growBy(graph_.alloc(), num);
 }
 
+bool
+MBasicBlock::ensureHasSlots(size_t num)
+{
+    size_t depth = stackDepth() + num;
+    if (depth > nslots()) {
+        if (!increaseSlots(depth - nslots()))
+            return false;
+    }
+    return true;
+}
+
 void
 MBasicBlock::copySlots(MBasicBlock *from)
 {
@@ -326,7 +355,7 @@ MBasicBlock::copySlots(MBasicBlock *from)
 
 bool
 MBasicBlock::inherit(TempAllocator &alloc, BytecodeAnalysis *analysis, MBasicBlock *pred,
-                     uint32_t popped)
+                     uint32_t popped, unsigned stackPhiCount)
 {
     if (pred) {
         stackPosition_ = pred->stackPosition_;
@@ -357,7 +386,29 @@ MBasicBlock::inherit(TempAllocator &alloc, BytecodeAnalysis *analysis, MBasicBlo
             return false;
 
         if (kind_ == PENDING_LOOP_HEADER) {
-            for (size_t i = 0; i < stackDepth(); i++) {
+            size_t i = 0;
+            for (i = 0; i < info().firstStackSlot(); i++) {
+                MPhi *phi = MPhi::New(alloc, i);
+                if (!phi->addInputSlow(pred->getSlot(i)))
+                    return false;
+                addPhi(phi);
+                setSlot(i, phi);
+                entryResumePoint()->setOperand(i, phi);
+            }
+
+            JS_ASSERT(stackPhiCount <= stackDepth());
+            JS_ASSERT(info().firstStackSlot() <= stackDepth() - stackPhiCount);
+
+            // Avoid creating new phis for stack values that aren't part of the
+            // loop.  Note that for loop headers that can OSR, all values on the
+            // stack are part of the loop.
+            for (; i < stackDepth() - stackPhiCount; i++) {
+                MDefinition *val = pred->getSlot(i);
+                setSlot(i, val);
+                entryResumePoint()->setOperand(i, val);
+            }
+
+            for (; i < stackDepth(); i++) {
                 MPhi *phi = MPhi::New(alloc, i);
                 if (!phi->addInputSlow(pred->getSlot(i)))
                     return false;
@@ -764,6 +815,7 @@ MBasicBlock::discardAllResumePoints(bool discardEntry)
 void
 MBasicBlock::insertBefore(MInstruction *at, MInstruction *ins)
 {
+    JS_ASSERT(at->block() == this);
     ins->setBlock(this);
     graph().allocDefinitionId(ins);
     instructions_.insertBefore(at, ins);
@@ -773,6 +825,7 @@ MBasicBlock::insertBefore(MInstruction *at, MInstruction *ins)
 void
 MBasicBlock::insertAfter(MInstruction *at, MInstruction *ins)
 {
+    JS_ASSERT(at->block() == this);
     ins->setBlock(this);
     graph().allocDefinitionId(ins);
     instructions_.insertAfter(at, ins);
@@ -907,11 +960,20 @@ MBasicBlock::assertUsesAreNotWithin(MUseIterator use, MUseIterator end)
 }
 
 bool
-MBasicBlock::dominates(MBasicBlock *other)
+MBasicBlock::dominates(const MBasicBlock *other) const
 {
     uint32_t high = domIndex() + numDominated();
     uint32_t low  = domIndex();
     return other->domIndex() >= low && other->domIndex() <= high;
+}
+
+void
+MBasicBlock::setUnreachable()
+{
+    unreachable_ = true;
+    size_t numDom = numImmediatelyDominatedBlocks();
+    for (size_t d = 0; d < numDom; d++)
+        getImmediatelyDominatedBlock(d)->unreachable_ = true;
 }
 
 AbortReason
@@ -1141,13 +1203,15 @@ MBasicBlock::inheritPhis(MBasicBlock *header)
     }
 }
 
-void
+bool
 MBasicBlock::specializePhis()
 {
     for (MPhiIterator iter = phisBegin(); iter != phisEnd(); iter++) {
         MPhi *phi = *iter;
-        phi->specializeType();
+        if (!phi->specializeType())
+            return false;
     }
+    return true;
 }
 
 void

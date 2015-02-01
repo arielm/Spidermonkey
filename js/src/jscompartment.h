@@ -9,9 +9,11 @@
 
 #include "mozilla/MemoryReporting.h"
 
-#include "builtin/TypeRepresentation.h"
+#include "builtin/TypedObject.h"
 #include "gc/Zone.h"
 #include "vm/GlobalObject.h"
+#include "vm/PIC.h"
+#include "vm/SavedStacks.h"
 
 namespace js {
 
@@ -111,7 +113,6 @@ struct TypeInferenceSizes;
 
 namespace js {
 class AutoDebugModeInvalidation;
-class ArrayBufferObject;
 class DebugScopes;
 class WeakMapBase;
 }
@@ -127,6 +128,7 @@ struct JSCompartment
   public:
     JSPrincipals                 *principals;
     bool                         isSystem;
+    bool                         isSelfHosting;
     bool                         marked;
 
 #ifdef DEBUG
@@ -187,8 +189,6 @@ struct JSCompartment
      */
     void adoptWorkerAllocator(js::Allocator *workerAllocator);
 
-
-    int64_t                      lastCodeRelease;
     bool                         activeAnalysis;
 
     /* Type information about the scripts and objects in this compartment. */
@@ -199,6 +199,8 @@ struct JSCompartment
   private:
     js::ObjectMetadataCallback   objectMetadataCallback;
 
+    js::SavedStacks              savedStacks_;
+
     js::WrapperMap               crossCompartmentWrappers;
 
   public:
@@ -206,9 +208,6 @@ struct JSCompartment
     int64_t                      lastAnimationTime;
 
     js::RegExpCompartment        regExps;
-
-    /* Set of all currently living type representations. */
-    js::TypeRepresentationHash   typeReprs;
 
     /*
      * For generational GC, record whether a write barrier has added this
@@ -221,7 +220,6 @@ struct JSCompartment
 
   public:
     void addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf,
-                                size_t *tiPendingArrays,
                                 size_t *tiAllocationSiteTables,
                                 size_t *tiArrayTypeTables,
                                 size_t *tiObjectTypeTables,
@@ -230,7 +228,7 @@ struct JSCompartment
                                 size_t *crossCompartmentWrappers,
                                 size_t *regexpCompartment,
                                 size_t *debuggeesSet,
-                                size_t *baselineStubsOptimized);
+                                size_t *savedStacksSet);
 
     /*
      * Shared scope property tree, and arena-pool for allocating its nodes.
@@ -244,12 +242,16 @@ struct JSCompartment
     /* Set of initial shapes in the compartment. */
     js::InitialShapeSet          initialShapes;
     void sweepInitialShapeTable();
-    void markAllInitialShapeTableEntries(JSTracer *trc);
 
     /* Set of default 'new' or lazy types in the compartment. */
-    js::types::TypeObjectSet     newTypeObjects;
-    js::types::TypeObjectSet     lazyTypeObjects;
-    void sweepNewTypeObjectTable(js::types::TypeObjectSet &table);
+    js::types::TypeObjectWithNewScriptSet newTypeObjects;
+    js::types::TypeObjectWithNewScriptSet lazyTypeObjects;
+    void sweepNewTypeObjectTable(js::types::TypeObjectWithNewScriptSet &table);
+#if defined(JSGC_GENERATIONAL) && defined(JS_GC_ZEAL)
+    void checkNewTypeObjectTableAfterMovingGC();
+    void checkInitialShapesTableAfterMovingGC();
+    void checkWrapperMapAfterMovingGC();
+#endif
 
     /*
      * Hash table of all manually call site-cloned functions from within
@@ -258,6 +260,12 @@ struct JSCompartment
      */
     js::CallsiteCloneTable callsiteClones;
     void sweepCallsiteClones();
+
+    /*
+     * Lazily initialized script source object to use for scripts cloned
+     * from the self-hosting global.
+     */
+    js::ReadBarriered<js::ScriptSourceObject> selfHostingScriptSource;
 
     /* During GC, stores the index of this compartment in rt->compartments. */
     unsigned                     gcIndex;
@@ -271,8 +279,8 @@ struct JSCompartment
      */
     JSObject                     *gcIncomingGrayPointers;
 
-    /* Linked list of live array buffers with >1 view. */
-    js::ArrayBufferObject        *gcLiveArrayBuffers;
+    /* During GC, list of live array buffers with >1 view accumulated during tracing. */
+    js::ArrayBufferVector        gcLiveArrayBuffers;
 
     /* Linked list of live weakmaps in this compartment. */
     js::WeakMapBase              *gcWeakMapList;
@@ -296,7 +304,6 @@ struct JSCompartment
 
     /* Mark cross-compartment wrappers. */
     void markCrossCompartmentWrappers(JSTracer *trc);
-    void markAllCrossCompartmentWrappers(JSTracer *trc);
 
     inline bool wrap(JSContext *cx, JS::MutableHandleValue vp,
                      JS::HandleObject existing = js::NullPtr());
@@ -311,7 +318,7 @@ struct JSCompartment
     bool wrap(JSContext *cx, JS::MutableHandle<js::PropertyDescriptor> desc);
     bool wrap(JSContext *cx, js::AutoIdVector &props);
 
-    bool putWrapper(const js::CrossCompartmentKey& wrapped, const js::Value& wrapper);
+    bool putWrapper(JSContext *cx, const js::CrossCompartmentKey& wrapped, const js::Value& wrapper);
 
     js::WrapperMap::Ptr lookupWrapper(const js::Value& wrapped) {
         return crossCompartmentWrappers.lookup(wrapped);
@@ -325,7 +332,8 @@ struct JSCompartment
         WrapperEnum(JSCompartment *c) : js::WrapperMap::Enum(c->crossCompartmentWrappers) {}
     };
 
-    void mark(JSTracer *trc);
+    void trace(JSTracer *trc);
+    void markRoots(JSTracer *trc);
     bool isDiscardingJitCode(JSTracer *trc);
     void sweep(js::FreeOp *fop, bool releaseTypes);
     void sweepCrossCompartmentWrappers();
@@ -337,6 +345,8 @@ struct JSCompartment
     bool callObjectMetadataCallback(JSContext *cx, JSObject **obj) const {
         return objectMetadataCallback(cx, obj);
     }
+
+    js::SavedStacks &savedStacks() { return savedStacks_; }
 
     void findOutgoingEdges(js::gc::ComponentFinder<JS::Zone> &finder);
 
@@ -391,22 +401,27 @@ struct JSCompartment
   private:
 
     /* This is called only when debugMode() has just toggled. */
-    void updateForDebugMode(js::FreeOp *fop, js::AutoDebugModeInvalidation &invalidate);
+    bool updateJITForDebugMode(JSContext *maybecx, js::AutoDebugModeInvalidation &invalidate);
 
   public:
     js::GlobalObjectSet &getDebuggees() { return debuggees; }
     bool addDebuggee(JSContext *cx, js::GlobalObject *global);
     bool addDebuggee(JSContext *cx, js::GlobalObject *global,
                      js::AutoDebugModeInvalidation &invalidate);
-    void removeDebuggee(js::FreeOp *fop, js::GlobalObject *global,
+    bool removeDebuggee(JSContext *cx, js::GlobalObject *global,
                         js::GlobalObjectSet::Enum *debuggeesEnum = nullptr);
-    void removeDebuggee(js::FreeOp *fop, js::GlobalObject *global,
+    bool removeDebuggee(JSContext *cx, js::GlobalObject *global,
                         js::AutoDebugModeInvalidation &invalidate,
                         js::GlobalObjectSet::Enum *debuggeesEnum = nullptr);
+    void removeDebuggeeUnderGC(js::FreeOp *fop, js::GlobalObject *global,
+                               js::GlobalObjectSet::Enum *debuggeesEnum = nullptr);
+    void removeDebuggeeUnderGC(js::FreeOp *fop, js::GlobalObject *global,
+                               js::AutoDebugModeInvalidation &invalidate,
+                               js::GlobalObjectSet::Enum *debuggeesEnum = nullptr);
     bool setDebugModeFromC(JSContext *cx, bool b,
                            js::AutoDebugModeInvalidation &invalidate);
 
-    void clearBreakpointsIn(js::FreeOp *fop, js::Debugger *dbg, JSObject *handler);
+    void clearBreakpointsIn(js::FreeOp *fop, js::Debugger *dbg, JS::HandleObject handler);
     void clearTraps(js::FreeOp *fop);
 
   private:
@@ -502,18 +517,12 @@ class js::AutoDebugModeInvalidation
         // must all agree on the toggle. This is so we can decide if we need
         // to invalidate on-stack scripts.
         MOZ_ASSERT_IF(needInvalidation_ != NoNeed,
-                      needInvalidation_ == debugMode ? ToggledOn : ToggledOff);
+                      needInvalidation_ == (debugMode ? ToggledOn : ToggledOff));
         needInvalidation_ = debugMode ? ToggledOn : ToggledOff;
     }
 };
 
 namespace js {
-
-inline bool
-ExclusiveContext::typeInferenceEnabled() const
-{
-    return compartment_->options().typeInference(this);
-}
 
 inline js::Handle<js::GlobalObject*>
 ExclusiveContext::global() const
@@ -524,6 +533,7 @@ ExclusiveContext::global() const
      * barrier on it. Once the compartment is popped, the handle is no longer
      * safe to use.
      */
+    MOZ_ASSERT(compartment_, "Caller needs to enter a compartment first");
     return Handle<GlobalObject*>::fromMarkedLocation(compartment_->global_.unsafeGet());
 }
 

@@ -99,8 +99,14 @@ AC_DEFUN([MOZ_DEBUGGING_OPTS],
 [
 dnl Debug info is ON by default.
 if test -z "$MOZ_DEBUG_FLAGS"; then
-  MOZ_DEBUG_FLAGS="-g"
+  if test -n "$_MSC_VER"; then
+    MOZ_DEBUG_FLAGS="-Zi"
+  else
+    MOZ_DEBUG_FLAGS="-g"
+  fi
 fi
+
+AC_SUBST(MOZ_DEBUG_FLAGS)
 
 MOZ_ARG_ENABLE_STRING(debug,
 [  --enable-debug[=DBG]    Enable building with developer debug info
@@ -308,8 +314,8 @@ if test "$GNU_CC" -a "$GCC_USE_GNU_LD" -a -z "$DEVELOPER_OPTIONS"; then
             if AC_TRY_COMMAND([${CC-cc} -o conftest.${ac_objext} $CFLAGS $MOZ_DEBUG_FLAGS -c conftest.${ac_ext} 1>&2]) &&
                 AC_TRY_COMMAND([${CC-cc} -o conftest${ac_exeext} $LDFLAGS $MOZ_DEBUG_FLAGS -Wl,--gc-sections conftest.${ac_objext} $LIBS 1>&2]) &&
                 test -s conftest${ac_exeext} -a -s conftest.${ac_objext}; then
-                 if test "`$PYTHON "$_topsrcdir"/build/autoconf/check_debug_ranges.py conftest.${ac_objext} conftest.${ac_ext}`" = \
-                         "`$PYTHON "$_topsrcdir"/build/autoconf/check_debug_ranges.py conftest${ac_exeext} conftest.${ac_ext}`"; then
+                 if test "`$PYTHON -m mozbuild.configure.check_debug_ranges conftest.${ac_objext} conftest.${ac_ext}`" = \
+                         "`$PYTHON -m mozbuild.configure.check_debug_ranges conftest${ac_exeext} conftest.${ac_ext}`"; then
                      GC_SECTIONS_BREAKS_DEBUG_RANGES=no
                  else
                      GC_SECTIONS_BREAKS_DEBUG_RANGES=yes

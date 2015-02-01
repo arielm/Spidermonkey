@@ -148,13 +148,9 @@ extern bool
 StringToNumber(ThreadSafeContext *cx, JSString *str, double *result);
 
 /* ES5 9.3 ToNumber, overwriting *vp with the appropriate number value. */
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 ToNumber(JSContext *cx, JS::MutableHandleValue vp)
 {
-#ifdef DEBUG
-    MaybeCheckStackRoots(cx);
-#endif
-
     if (vp.isNumber())
         return true;
     double d;
@@ -193,14 +189,14 @@ js_num_valueOf(JSContext *cx, unsigned argc, js::Value *vp);
 
 namespace js {
 
-static JS_ALWAYS_INLINE bool
+static MOZ_ALWAYS_INLINE bool
 ValueFitsInInt32(const Value &v, int32_t *pi)
 {
     if (v.isInt32()) {
         *pi = v.toInt32();
         return true;
     }
-    return v.isDouble() && mozilla::DoubleIsInt32(v.toDouble(), pi);
+    return v.isDouble() && mozilla::NumberIsInt32(v.toDouble(), pi);
 }
 
 /*
@@ -212,7 +208,7 @@ ValueFitsInInt32(const Value &v, int32_t *pi)
  * indexes will be reported not to be indexes by this method.  Users must
  * consider this possibility when using this method.
  */
-static JS_ALWAYS_INLINE bool
+static MOZ_ALWAYS_INLINE bool
 IsDefinitelyIndex(const Value &v, uint32_t *indexp)
 {
     if (v.isInt32() && v.toInt32() >= 0) {
@@ -221,7 +217,7 @@ IsDefinitelyIndex(const Value &v, uint32_t *indexp)
     }
 
     int32_t i;
-    if (v.isDouble() && mozilla::DoubleIsInt32(v.toDouble(), &i) && i >= 0) {
+    if (v.isDouble() && mozilla::NumberIsInt32(v.toDouble(), &i) && i >= 0) {
         *indexp = uint32_t(i);
         return true;
     }
@@ -233,13 +229,6 @@ IsDefinitelyIndex(const Value &v, uint32_t *indexp)
 static inline bool
 ToInteger(JSContext *cx, HandleValue v, double *dp)
 {
-#ifdef DEBUG
-    {
-        SkipRoot skip(cx, &v);
-        MaybeCheckStackRoots(cx);
-    }
-#endif
-
     if (v.isInt32()) {
         *dp = v.toInt32();
         return true;
@@ -286,7 +275,7 @@ ToNumberSlow(ExclusiveContext *cx, Value v, double *dp);
 
 // Variant of ToNumber which takes an ExclusiveContext instead of a JSContext.
 // ToNumber is part of the API and can't use ExclusiveContext directly.
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 ToNumber(ExclusiveContext *cx, const Value &v, double *out)
 {
     if (v.isNumber()) {
@@ -329,7 +318,7 @@ NonObjectToInt32(ThreadSafeContext *cx, const Value &v, int32_t *out)
 bool
 NonObjectToUint32Slow(ThreadSafeContext *cx, const Value &v, uint32_t *out);
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 NonObjectToUint32(ThreadSafeContext *cx, const Value &v, uint32_t *out)
 {
     if (v.isInt32()) {

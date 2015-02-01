@@ -6,6 +6,8 @@
 
 #include "jit/AsmJSSignalHandlers.h"
 
+#include "mozilla/BinarySearch.h"
+
 #include "assembler/assembler/MacroAssembler.h"
 #include "jit/AsmJSModule.h"
 
@@ -187,7 +189,7 @@ class AutoSetHandlingSignal
     }
 };
 
-#if defined(JS_CPU_X64)
+#if defined(JS_CODEGEN_X64)
 template <class T>
 static void
 SetXMMRegToNaN(bool isFloat32, T *xmm_reg)
@@ -207,35 +209,29 @@ SetXMMRegToNaN(bool isFloat32, T *xmm_reg)
     }
 }
 
+struct GetHeapAccessOffset
+{
+    const AsmJSModule &module;
+    explicit GetHeapAccessOffset(const AsmJSModule &module) : module(module) {}
+    uintptr_t operator[](size_t index) const {
+        return module.heapAccess(index).offset();
+    }
+};
+
 // Perform a binary search on the projected offsets of the known heap accesses
 // in the module.
 static const AsmJSHeapAccess *
 LookupHeapAccess(const AsmJSModule &module, uint8_t *pc)
 {
     JS_ASSERT(module.containsPC(pc));
-    size_t targetOffset = pc - module.codeBase();
 
-    if (module.numHeapAccesses() == 0)
+    uintptr_t pcOff = pc - module.codeBase();
+
+    size_t match;
+    if (!BinarySearch(GetHeapAccessOffset(module), 0, module.numHeapAccesses(), pcOff, &match))
         return nullptr;
 
-    size_t low = 0;
-    size_t high = module.numHeapAccesses() - 1;
-    while (high - low >= 2) {
-        size_t mid = low + (high - low) / 2;
-        uint32_t midOffset = module.heapAccess(mid).offset();
-        if (targetOffset == midOffset)
-            return &module.heapAccess(mid);
-        if (targetOffset < midOffset)
-            high = mid;
-        else
-            low = mid;
-    }
-    if (targetOffset == module.heapAccess(low).offset())
-        return &module.heapAccess(low);
-    if (targetOffset == module.heapAccess(high).offset())
-        return &module.heapAccess(high);
-
-    return nullptr;
+    return &module.heapAccess(match);
 }
 #endif
 
@@ -250,7 +246,7 @@ LookupHeapAccess(const AsmJSModule &module, uint8_t *pc)
 # include <sys/ucontext.h> // for ucontext_t, mcontext_t
 #endif
 
-#if defined(JS_CPU_X64)
+#if defined(JS_CODEGEN_X64)
 # if defined(__DragonFly__)
 #  include <machine/npx.h> // for union savefpu
 # elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || \
@@ -332,6 +328,29 @@ static bool IsSignalHandlingBroken() { return false; }
 # define PC_sig(p) R15_sig(p)
 #endif
 
+static bool
+HandleSimulatorInterrupt(JSRuntime *rt, AsmJSActivation *activation, void *faultingAddress)
+{
+    // If the ARM simulator is enabled, the pc is in the simulator C++ code and
+    // not in the generated code, so we check the simulator's pc manually. Also
+    // note that we can't simply use simulator->set_pc() here because the
+    // simulator could be in the middle of an instruction. On ARM, the signal
+    // handlers are currently only used for Odin code, see bug 964258.
+
+#ifdef JS_ARM_SIMULATOR
+    const AsmJSModule &module = activation->module();
+    if (module.containsPC((void *)rt->mainThread.simulator()->get_pc()) &&
+        module.containsPC(faultingAddress))
+    {
+        activation->setInterrupted(nullptr);
+        int32_t nextpc = int32_t(module.interruptExit());
+        rt->mainThread.simulator()->set_resume_pc(nextpc);
+        return true;
+    }
+#endif
+    return false;
+}
+
 #if !defined(XP_MACOSX)
 static uint8_t **
 ContextToPC(CONTEXT *context)
@@ -340,7 +359,7 @@ ContextToPC(CONTEXT *context)
     return reinterpret_cast<uint8_t**>(&PC_sig(context));
 }
 
-# if defined(JS_CPU_X64)
+# if defined(JS_CODEGEN_X64)
 static void
 SetRegisterToCoercedUndefined(CONTEXT *context, bool isFloat32, AnyRegister reg)
 {
@@ -386,7 +405,7 @@ SetRegisterToCoercedUndefined(CONTEXT *context, bool isFloat32, AnyRegister reg)
         }
     }
 }
-# endif  // JS_CPU_X64
+# endif  // JS_CODEGEN_X64
 #endif   // !XP_MACOSX
 
 #if defined(XP_WIN)
@@ -428,20 +447,20 @@ HandleException(PEXCEPTION_POINTERS exception)
         return false;
 
     // If we faulted trying to execute code in 'module', this must be an
-    // operation callback (see TriggerOperationCallbackForAsmJSCode). Redirect
-    // execution to a trampoline which will call js_HandleExecutionInterrupt.
+    // interrupt callback (see RequestInterruptForAsmJSCode). Redirect
+    // execution to a trampoline which will call js::HandleExecutionInterrupt.
     // The trampoline will jump to activation->resumePC if execution isn't
     // interrupted.
     if (module.containsPC(faultingAddress)) {
-        activation->setResumePC(pc);
-        *ppc = module.operationCallbackExit();
-        DWORD oldProtect;
-        if (!VirtualProtect(module.codeBase(), module.functionBytes(), PAGE_EXECUTE, &oldProtect))
-            MOZ_CRASH();
+        activation->setInterrupted(pc);
+        *ppc = module.interruptExit();
+
+        JSRuntime::AutoLockForInterrupt lock(rt);
+        module.unprotectCode(rt);
         return true;
     }
 
-# if defined(JS_CPU_X64)
+# if defined(JS_CODEGEN_X64)
     // These checks aren't necessary, but, since we can, check anyway to make
     // sure we aren't covering up a real bug.
     if (!module.maybeHeap() ||
@@ -490,7 +509,7 @@ AsmJSExceptionHandler(LPEXCEPTION_POINTERS exception)
 static uint8_t **
 ContextToPC(x86_thread_state_t &state)
 {
-# if defined(JS_CPU_X64)
+# if defined(JS_CODEGEN_X64)
     JS_STATIC_ASSERT(sizeof(state.uts.ts64.__rip) == sizeof(void*));
     return reinterpret_cast<uint8_t**>(&state.uts.ts64.__rip);
 # else
@@ -499,7 +518,7 @@ ContextToPC(x86_thread_state_t &state)
 # endif
 }
 
-# if defined(JS_CPU_X64)
+# if defined(JS_CODEGEN_X64)
 static bool
 SetRegisterToCoercedUndefined(mach_port_t rtThread, x86_thread_state64_t &state,
                               const AsmJSHeapAccess &heapAccess)
@@ -621,25 +640,33 @@ HandleMachException(JSRuntime *rt, const ExceptionRequest &request)
         return false;
 
     const AsmJSModule &module = activation->module();
+    if (HandleSimulatorInterrupt(rt, activation, faultingAddress)) {
+        JSRuntime::AutoLockForInterrupt lock(rt);
+        module.unprotectCode(rt);
+        return true;
+    }
+
     if (!module.containsPC(pc))
         return false;
 
     // If we faulted trying to execute code in 'module', this must be an
-    // operation callback (see TriggerOperationCallbackForAsmJSCode). Redirect
-    // execution to a trampoline which will call js_HandleExecutionInterrupt.
+    // interrupt callback (see RequestInterruptForAsmJSCode). Redirect
+    // execution to a trampoline which will call js::HandleExecutionInterrupt.
     // The trampoline will jump to activation->resumePC if execution isn't
     // interrupted.
     if (module.containsPC(faultingAddress)) {
-        activation->setResumePC(pc);
-        *ppc = module.operationCallbackExit();
-        mprotect(module.codeBase(), module.functionBytes(), PROT_EXEC);
+        activation->setInterrupted(pc);
+        *ppc = module.interruptExit();
+
+        JSRuntime::AutoLockForInterrupt lock(rt);
+        module.unprotectCode(rt);
 
         // Update the thread state with the new pc.
         kret = thread_set_state(rtThread, x86_THREAD_STATE, (thread_state_t)&state, x86_THREAD_STATE_COUNT);
         return kret == KERN_SUCCESS;
     }
 
-# if defined(JS_CPU_X64)
+# if defined(JS_CODEGEN_X64)
     // These checks aren't necessary, but, since we can, check anyway to make
     // sure we aren't covering up a real bug.
     if (!module.maybeHeap() ||
@@ -863,22 +890,30 @@ HandleSignal(int signum, siginfo_t *info, void *ctx)
         return false;
 
     const AsmJSModule &module = activation->module();
+    if (HandleSimulatorInterrupt(rt, activation, faultingAddress)) {
+        JSRuntime::AutoLockForInterrupt lock(rt);
+        module.unprotectCode(rt);
+        return true;
+    }
+
     if (!module.containsPC(pc))
         return false;
 
     // If we faulted trying to execute code in 'module', this must be an
-    // operation callback (see TriggerOperationCallbackForAsmJSCode). Redirect
-    // execution to a trampoline which will call js_HandleExecutionInterrupt.
+    // interrupt callback (see RequestInterruptForAsmJSCode). Redirect
+    // execution to a trampoline which will call js::HandleExecutionInterrupt.
     // The trampoline will jump to activation->resumePC if execution isn't
     // interrupted.
     if (module.containsPC(faultingAddress)) {
-        activation->setResumePC(pc);
-        *ppc = module.operationCallbackExit();
-        mprotect(module.codeBase(), module.functionBytes(), PROT_EXEC);
+        activation->setInterrupted(pc);
+        *ppc = module.interruptExit();
+
+        JSRuntime::AutoLockForInterrupt lock(rt);
+        module.unprotectCode(rt);
         return true;
     }
 
-# if defined(JS_CPU_X64)
+# if defined(JS_CODEGEN_X64)
     // These checks aren't necessary, but, since we can, check anyway to make
     // sure we aren't covering up a real bug.
     if (!module.maybeHeap() ||
@@ -976,34 +1011,25 @@ js::EnsureAsmJSSignalHandlersInstalled(JSRuntime *rt)
 }
 
 // To interrupt execution of a JSRuntime, any thread may call
-// JS_TriggerOperationCallback (JSRuntime::triggerOperationCallback from inside
-// the engine). Normally, this sets some state that is polled at regular
-// intervals (function prologues, loop headers), even from jit-code. For tight
-// loops, this poses non-trivial overhead. For asm.js, we can do better: when
-// another thread triggers the operation callback, we simply mprotect all of
-// the innermost asm.js module activation's code. This will trigger a SIGSEGV,
-// taking us into AsmJSFaultHandler. From there, we can manually redirect
-// execution to call js_HandleExecutionInterrupt. The memory is un-protected
-// from the signal handler after control flow is redirected.
+// JS_RequestInterruptCallback (JSRuntime::requestInterruptCallback from inside
+// the engine). In the simplest case, this sets some state that is polled at
+// regular intervals (function prologues, loop headers). For tight loops, this
+// poses non-trivial overhead. For asm.js, we can do better: when another
+// thread requests an interrupt, we simply mprotect all of the innermost asm.js
+// module activation's code. This will trigger a SIGSEGV, taking us into
+// AsmJSFaultHandler. From there, we can manually redirect execution to call
+// js::HandleExecutionInterrupt. The memory is un-protected from the signal
+// handler after control flow is redirected.
 void
-js::TriggerOperationCallbackForAsmJSCode(JSRuntime *rt)
+js::RequestInterruptForAsmJSCode(JSRuntime *rt)
 {
-    JS_ASSERT(rt->currentThreadOwnsOperationCallbackLock());
+    JS_ASSERT(rt->currentThreadOwnsInterruptLock());
 
     AsmJSActivation *activation = rt->mainThread.asmJSActivationStackFromAnyThread();
     if (!activation)
         return;
 
-    const AsmJSModule &module = activation->module();
-
-#if defined(XP_WIN)
-    DWORD oldProtect;
-    if (!VirtualProtect(module.codeBase(), module.functionBytes(), PAGE_NOACCESS, &oldProtect))
-        MOZ_CRASH();
-#else  // assume Unix
-    if (mprotect(module.codeBase(), module.functionBytes(), PROT_NONE))
-        MOZ_CRASH();
-#endif
+    activation->module().protectCode(rt);
 }
 
 #if defined(MOZ_ASAN) && defined(JS_STANDALONE)

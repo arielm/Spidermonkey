@@ -23,14 +23,14 @@ using mozilla::RangedPtr;
 using mozilla::RoundUpPow2;
 
 bool
-JSString::isShort() const
+JSString::isFatInline() const
 {
-    // It's possible for short strings to be converted to flat strings;  as a
-    // result, checking just for the arena isn't enough to determine if a
-    // string is short.  Hence the isInline() check.
-    bool is_short = (getAllocKind() == gc::FINALIZE_SHORT_STRING) && isInline();
-    JS_ASSERT_IF(is_short, isFlat());
-    return is_short;
+    // It's possible for fat-inline strings to be converted to flat strings;
+    // as a result, checking just for the arena isn't enough to determine if a
+    // string is fat-inline.  Hence the isInline() check.
+    bool is_FatInline = (getAllocKind() == gc::FINALIZE_FAT_INLINE_STRING) && isInline();
+    JS_ASSERT_IF(is_FatInline, isFlat());
+    return is_FatInline;
 }
 
 bool
@@ -66,13 +66,13 @@ JSString::sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf)
     if (isExternal())
         return 0;
 
-    // JSInlineString, JSShortString [JSInlineAtom, JSShortAtom]: the chars are inline.
+    // JSInlineString, JSFatInlineString [JSInlineAtom, JSFatInlineAtom]: the chars are inline.
     if (isInline())
         return 0;
 
-    // JSAtom, JSStableString, JSUndependedString: measure the space for the
-    // chars.  For JSUndependedString, there is no need to count the base
-    // string, for the same reason as JSDependentString above.
+    // JSAtom, JSUndependedString: measure the space for the chars.  For
+    // JSUndependedString, there is no need to count the base string, for the
+    // same reason as JSDependentString above.
     JSFlatString &flat = asFlat();
     return mallocSizeOf(flat.chars());
 }
@@ -135,7 +135,7 @@ JSString::equals(const char *s)
 }
 #endif /* DEBUG */
 
-static JS_ALWAYS_INLINE bool
+static MOZ_ALWAYS_INLINE bool
 AllocChars(ThreadSafeContext *maybecx, size_t length, jschar **chars, size_t *capacity)
 {
     /*
@@ -395,8 +395,8 @@ js::ConcatStrings(ThreadSafeContext *cx,
     if (!JSString::validateLength(cx, wholeLength))
         return nullptr;
 
-    if (JSShortString::lengthFits(wholeLength) && cx->isJSContext()) {
-        JSShortString *str = js_NewGCShortString<allowGC>(cx);
+    if (JSFatInlineString::lengthFits(wholeLength) && cx->isJSContext()) {
+        JSFatInlineString *str = js_NewGCFatInlineString<allowGC>(cx);
         if (!str)
             return nullptr;
 
@@ -468,21 +468,6 @@ JSDependentString::undepend(ExclusiveContext *cx)
     d.lengthAndFlags = buildLengthAndFlags(n, UNDEPENDED_FLAGS);
 
     return &this->asFlat();
-}
-
-JSStableString *
-JSInlineString::uninline(ExclusiveContext *maybecx)
-{
-    JS_ASSERT(isInline());
-    size_t n = length();
-    jschar *news = maybecx ? maybecx->pod_malloc<jschar>(n + 1) : js_pod_malloc<jschar>(n + 1);
-    if (!news)
-        return nullptr;
-    js_strncpy(news, d.inlineStorage, n);
-    news[n] = 0;
-    d.u1.chars = news;
-    JS_ASSERT(!isInline());
-    return &asStable();
 }
 
 bool
@@ -601,18 +586,18 @@ StaticStrings::init(JSContext *cx)
 
     for (uint32_t i = 0; i < UNIT_STATIC_LIMIT; i++) {
         jschar buffer[] = { jschar(i), '\0' };
-        JSFlatString *s = js_NewStringCopyN<CanGC>(cx, buffer, 1);
+        JSFlatString *s = js_NewStringCopyN<NoGC>(cx, buffer, 1);
         if (!s)
             return false;
-        unitStaticTable[i] = s->morphAtomizedStringIntoAtom();
+        unitStaticTable[i] = s->morphAtomizedStringIntoPermanentAtom();
     }
 
     for (uint32_t i = 0; i < NUM_SMALL_CHARS * NUM_SMALL_CHARS; i++) {
         jschar buffer[] = { FROM_SMALL_CHAR(i >> 6), FROM_SMALL_CHAR(i & 0x3F), '\0' };
-        JSFlatString *s = js_NewStringCopyN<CanGC>(cx, buffer, 2);
+        JSFlatString *s = js_NewStringCopyN<NoGC>(cx, buffer, 2);
         if (!s)
             return false;
-        length2StaticTable[i] = s->morphAtomizedStringIntoAtom();
+        length2StaticTable[i] = s->morphAtomizedStringIntoPermanentAtom();
     }
 
     for (uint32_t i = 0; i < INT_STATIC_LIMIT; i++) {
@@ -627,10 +612,10 @@ StaticStrings::init(JSContext *cx)
                                 jschar('0' + ((i / 10) % 10)),
                                 jschar('0' + (i % 10)),
                                 '\0' };
-            JSFlatString *s = js_NewStringCopyN<CanGC>(cx, buffer, 3);
+            JSFlatString *s = js_NewStringCopyN<NoGC>(cx, buffer, 3);
             if (!s)
                 return false;
-            intStaticTable[i] = s->morphAtomizedStringIntoAtom();
+            intStaticTable[i] = s->morphAtomizedStringIntoPermanentAtom();
         }
     }
 
@@ -642,21 +627,15 @@ StaticStrings::trace(JSTracer *trc)
 {
     /* These strings never change, so barriers are not needed. */
 
-    for (uint32_t i = 0; i < UNIT_STATIC_LIMIT; i++) {
-        if (unitStaticTable[i])
-            MarkStringUnbarriered(trc, &unitStaticTable[i], "unit-static-string");
-    }
+    for (uint32_t i = 0; i < UNIT_STATIC_LIMIT; i++)
+        MarkPermanentAtom(trc, unitStaticTable[i], "unit-static-string");
 
-    for (uint32_t i = 0; i < NUM_SMALL_CHARS * NUM_SMALL_CHARS; i++) {
-        if (length2StaticTable[i])
-            MarkStringUnbarriered(trc, &length2StaticTable[i], "length2-static-string");
-    }
+    for (uint32_t i = 0; i < NUM_SMALL_CHARS * NUM_SMALL_CHARS; i++)
+        MarkPermanentAtom(trc, length2StaticTable[i], "length2-static-string");
 
     /* This may mark some strings more than once, but so be it. */
-    for (uint32_t i = 0; i < INT_STATIC_LIMIT; i++) {
-        if (intStaticTable[i])
-            MarkStringUnbarriered(trc, &intStaticTable[i], "int-static-string");
-    }
+    for (uint32_t i = 0; i < INT_STATIC_LIMIT; i++)
+        MarkPermanentAtom(trc, intStaticTable[i], "int-static-string");
 }
 
 bool
@@ -665,9 +644,9 @@ StaticStrings::isStatic(JSAtom *atom)
     const jschar *chars = atom->chars();
     switch (atom->length()) {
       case 1:
-        return (chars[0] < UNIT_STATIC_LIMIT);
+        return chars[0] < UNIT_STATIC_LIMIT;
       case 2:
-        return (fitsInSmallChar(chars[0]) && fitsInSmallChar(chars[1]));
+        return fitsInSmallChar(chars[0]) && fitsInSmallChar(chars[1]);
       case 3:
         if ('1' <= chars[0] && chars[0] <= '9' &&
             '0' <= chars[1] && chars[1] <= '9' &&
@@ -676,7 +655,7 @@ StaticStrings::isStatic(JSAtom *atom)
                       (chars[1] - '0') * 10 +
                       (chars[2] - '0');
 
-            return (unsigned(i) < INT_STATIC_LIMIT);
+            return unsigned(i) < INT_STATIC_LIMIT;
         }
         return false;
       default:

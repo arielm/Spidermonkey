@@ -34,9 +34,9 @@ JSDStaticLock* _jsd_global_lock = nullptr;
 #ifdef DEBUG
 void JSD_ASSERT_VALID_CONTEXT(JSDContext* jsdc)
 {
-    JS_ASSERT(jsdc->inited);
-    JS_ASSERT(jsdc->jsrt);
-    JS_ASSERT(jsdc->glob);
+    MOZ_ASSERT(jsdc->inited);
+    MOZ_ASSERT(jsdc->jsrt);
+    MOZ_ASSERT(jsdc->glob);
 }
 #endif
 
@@ -56,7 +56,9 @@ static const JSClass global_class = {
     "JSDGlobal", JSCLASS_GLOBAL_FLAGS |
     JSCLASS_HAS_PRIVATE | JSCLASS_PRIVATE_IS_NSISUPPORTS,
     JS_PropertyStub,  JS_DeletePropertyStub,  JS_PropertyStub,  JS_StrictPropertyStub,
-    JS_EnumerateStub, JS_ResolveStub,   JS_ConvertStub,   global_finalize
+    JS_EnumerateStub, JS_ResolveStub,   JS_ConvertStub,   global_finalize,
+    nullptr, nullptr, nullptr,
+    JS_GlobalObjectTraceHook
 };
 
 static bool
@@ -117,16 +119,16 @@ _newJSDContext(JSRuntime*         jsrt,
     if( ! jsd_InitScriptManager(jsdc) )
         goto label_newJSDContext_failure;
 
-
-    jsdc->glob = CreateJSDGlobal(cx, &global_class);
-
-    if( ! jsdc->glob )
-        goto label_newJSDContext_failure;
-
     {
+        JS::RootedObject global(cx, CreateJSDGlobal(cx, &global_class));
+        if( ! global )
+            goto label_newJSDContext_failure;
+
+        jsdc->glob = global;
+
         JSAutoCompartment ac(cx, jsdc->glob);
-        ok = JS_AddNamedObjectRoot(cx, &jsdc->glob, "JSD context global") &&
-             JS_InitStandardClasses(cx, jsdc->glob);
+        ok = JS::AddNamedObjectRoot(cx, &jsdc->glob, "JSD context global") &&
+             JS_InitStandardClasses(cx, global);
     }
     if( ! ok )
         goto label_newJSDContext_failure;
@@ -143,7 +145,7 @@ _newJSDContext(JSRuntime*         jsrt,
 label_newJSDContext_failure:
     if( jsdc ) {
         if ( jsdc->glob )
-            JS_RemoveObjectRootRT(JS_GetRuntime(cx), &jsdc->glob);
+            JS::RemoveObjectRootRT(JS_GetRuntime(cx), &jsdc->glob);
         jsd_DestroyObjectManager(jsdc);
         jsd_DestroyAtomTable(jsdc);
         free(jsdc);
@@ -161,7 +163,7 @@ _destroyJSDContext(JSDContext* jsdc)
     JSD_UNLOCK();
 
     if ( jsdc->glob ) {
-        JS_RemoveObjectRootRT(jsdc->jsrt, &jsdc->glob);
+        JS::RemoveObjectRootRT(jsdc->jsrt, &jsdc->glob);
     }
     jsd_DestroyObjectManager(jsdc);
     jsd_DestroyAtomTable(jsdc);
@@ -209,8 +211,8 @@ jsd_DebuggerOnForUser(JSRuntime*         jsrt,
 JSDContext*
 jsd_DebuggerOn(void)
 {
-    JS_ASSERT(_jsrt);
-    JS_ASSERT(_validateUserCallbacks(&_callbacks));
+    MOZ_ASSERT(_jsrt);
+    MOZ_ASSERT(_validateUserCallbacks(&_callbacks));
     return jsd_DebuggerOnForUser(_jsrt, &_callbacks, _user, nullptr);
 }
 
@@ -337,7 +339,7 @@ jsd_DebugErrorHook(JSContext *cx, const char *message,
     
     if( ! jsdc )
     {
-        JS_ASSERT(0);
+        MOZ_ASSERT(0);
         return true;
     }
     if( JSD_IS_DANGEROUS_THREAD(jsdc) )
@@ -360,7 +362,7 @@ jsd_DebugErrorHook(JSContext *cx, const char *message,
             return false;
         case JSD_ERROR_REPORTER_DEBUG:
         {
-            jsval rval;
+            JS::RootedValue rval(cx);
             JSD_ExecutionHookProc   hook;
             void*                   hookData;
 
@@ -371,7 +373,7 @@ jsd_DebugErrorHook(JSContext *cx, const char *message,
             JSD_UNLOCK();
 
             jsd_CallExecutionHook(jsdc, cx, JSD_HOOK_DEBUG_REQUESTED,
-                                  hook, hookData, &rval);
+                                  hook, hookData, rval.address());
             /* XXX Should make this dependent on ExecutionHook retval */
             return true;
         }
@@ -380,7 +382,7 @@ jsd_DebugErrorHook(JSContext *cx, const char *message,
                 JS_ClearPendingException(cx);
             return false;
         default:
-            JS_ASSERT(0);
+            MOZ_ASSERT(0);
             break;
     }
     return true;

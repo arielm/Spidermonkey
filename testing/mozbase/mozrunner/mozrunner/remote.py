@@ -1,18 +1,29 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this file,
+# You can obtain one at http://mozilla.org/MPL/2.0/.
+
 import ConfigParser
 import os
 import posixpath
 import re
-import shutil
 import signal
+from StringIO import StringIO
 import subprocess
+import sys
 import tempfile
 import time
 
-from runner import Runner
 from mozdevice import DMError
+import mozfile
 import mozlog
 
-__all__ = ['RemoteRunner', 'B2GRunner', 'remote_runners']
+from .base import Runner
+
+
+__all__ = ['B2GRunner',
+           'RemoteRunner',
+           'remote_runners']
+
 
 class RemoteRunner(Runner):
 
@@ -25,8 +36,8 @@ class RemoteRunner(Runner):
                        restore=True,
                        **kwargs):
 
-        super(RemoteRunner, self).__init__(profile, clean_profile=clean_profile,
-                                           process_class=process_class, env=env, **kwargs)
+        Runner.__init__(self, profile, clean_profile=clean_profile,
+                        process_class=process_class, env=env, **kwargs)
         self.log = mozlog.getLogger('RemoteRunner')
 
         self.dm = devicemanager
@@ -34,7 +45,8 @@ class RemoteRunner(Runner):
         self.remote_test_root = remote_test_root or self.dm.getDeviceRoot()
         self.remote_profile = posixpath.join(self.remote_test_root, 'profile')
         self.restore = restore
-        self.backup_files = set([])
+        self.added_files = set()
+        self.backup_files = set()
 
     def backup_file(self, remote_path):
         if not self.restore:
@@ -43,7 +55,8 @@ class RemoteRunner(Runner):
         if self.dm.fileExists(remote_path):
             self.dm.shellCheckOutput(['dd', 'if=%s' % remote_path, 'of=%s.orig' % remote_path])
             self.backup_files.add(remote_path)
-
+        else:
+            self.added_files.add(remote_path)
 
     def check_for_crashes(self, last_test=None):
         last_test = last_test or self.last_test
@@ -55,9 +68,9 @@ class RemoteRunner(Runner):
             local_dump_dir = tempfile.mkdtemp()
             self.dm.getDirectory(remote_dump_dir, local_dump_dir)
 
-            crashed = super(RemoteRunner, self).check_for_crashes(local_dump_dir, \
-                                                                  test_name=last_test)
-            shutil.rmtree(local_dump_dir)
+            crashed = Runner.check_for_crashes(self, local_dump_dir, \
+                                               test_name=last_test)
+            mozfile.remove(local_dump_dir)
             self.dm.removeDir(remote_dump_dir)
 
         return crashed
@@ -66,12 +79,17 @@ class RemoteRunner(Runner):
         if not self.restore:
             return
 
-        super(RemoteRunner, self).cleanup()
+        Runner.cleanup(self)
+
+        self.dm.remount()
+        # Restore the original profile
+        for added_file in self.added_files:
+            self.dm.removeFile(added_file)
 
         for backup_file in self.backup_files:
-            # Restore the original profiles.ini
-            self.dm.shellCheckOutput(['dd', 'if=%s.orig' % backup_file, 'of=%s' % backup_file])
-            self.dm.removeFile("%s.orig" % backup_file)
+            if self.dm.fileExists('%s.orig' % backup_file):
+                self.dm.shellCheckOutput(['dd', 'if=%s.orig' % backup_file, 'of=%s' % backup_file])
+                self.dm.removeFile("%s.orig" % backup_file)
 
         # Delete any bundled extensions
         extension_dir = posixpath.join(self.remote_profile, 'extensions', 'staged')
@@ -84,12 +102,14 @@ class RemoteRunner(Runner):
         # Remove the test profile
         self.dm.removeDir(self.remote_profile)
 
+
 class B2GRunner(RemoteRunner):
 
-    def __init__(self, profile, devicemanager, marionette, context_chrome=True,
-                 test_script=None, test_script_args=None, **kwargs):
+    def __init__(self, profile, devicemanager, marionette=None, context_chrome=True,
+                 test_script=None, test_script_args=None,
+                 marionette_port=None, emulator=None, **kwargs):
 
-        super(B2GRunner, self).__init__(profile, devicemanager, **kwargs)
+        RemoteRunner.__init__(self, profile, devicemanager, **kwargs)
         self.log = mozlog.getLogger('B2GRunner')
 
         tmpfd, processLog = tempfile.mkstemp(suffix='pidlog')
@@ -99,10 +119,29 @@ class B2GRunner(RemoteRunner):
                      'MOZ_CRASHREPORTER_NO_REPORT': '1',
                      'MOZ_HIDE_RESULTS_TABLE': '1',
                      'MOZ_PROCESS_LOG': processLog,
+                     'NSPR_LOG_MODULES': 'signaling:5,mtransport:3',
+                     'R_LOG_LEVEL': '5',
+                     'R_LOG_DESTINATION': 'stderr',
+                     'R_LOG_VERBOSE': '1',
                      'NO_EM_RESTART': '1', }
         self.env.update(tmp_env)
         self.last_test = "automation"
+
         self.marionette = marionette
+        if self.marionette is not None:
+            if marionette_port is None:
+                marionette_port = self.marionette.port
+            elif self.marionette.port != marionette_port:
+                raise ValueError("Got a marionette object and a port but they don't match")
+
+            if emulator is None:
+                emulator = marionette.emulator
+            elif marionette.emulator != emulator:
+                raise ValueError("Got a marionette object and an emulator argument but they don't match")
+
+        self.marionette_port = marionette_port
+        self.emulator = emulator
+
         self.context_chrome = context_chrome
         self.test_script = test_script
         self.test_script_args = test_script_args
@@ -126,8 +165,8 @@ class B2GRunner(RemoteRunner):
         self.outputTimeout = outputTimeout
         self._setup_remote_profile()
         # reboot device so it starts up with the proper profile
-        if not self.marionette.emulator:
-            self._reboot_device()
+        if not self.emulator:
+            self.dm.reboot(wait=True)
             #wait for wlan to come up
             if not self._wait_for_net():
                 raise Exception("network did not come up, please configure the network" +
@@ -135,18 +174,27 @@ class B2GRunner(RemoteRunner):
 
         self.dm.shellCheckOutput(['stop', 'b2g'])
 
-        self.kp_kwargs['processOutputLine'] = [self.on_output]
-        self.kp_kwargs['onTimeout'] = [self.on_timeout]
+        self.kp_kwargs.update({'stream': sys.stdout,
+                               'processOutputLine': self.on_output,
+                               'onTimeout': self.on_timeout,})
         self.process_handler = self.process_class(self.command, **self.kp_kwargs)
         self.process_handler.run(timeout=timeout, outputTimeout=outputTimeout)
 
         # Set up port forwarding again for Marionette, since any that
         # existed previously got wiped out by the reboot.
-        if not self.marionette.emulator:
+        if self.emulator is None:
             subprocess.Popen([self.dm._adbPath,
                               'forward',
-                              'tcp:%s' % self.marionette.port,
-                              'tcp:%s' % self.marionette.port]).communicate()
+                              'tcp:%s' % self.marionette_port,
+                              'tcp:2828']).communicate()
+
+        if self.marionette is not None:
+            self.start_marionette()
+
+        if self.test_script is not None:
+            self.start_tests()
+
+    def start_marionette(self):
         self.marionette.wait_for_port()
 
         # start a marionette session
@@ -170,26 +218,24 @@ class B2GRunner(RemoteRunner):
         else:
             self.marionette.set_context(self.marionette.CONTEXT_CONTENT)
 
-        # run the script that starts the tests
 
-        if self.test_script:
-            if os.path.isfile(self.test_script):
-                script = open(self.test_script, 'r')
-                self.marionette.execute_script(script.read(), script_args=self.test_script_args)
-                script.close()
-            elif isinstance(self.test_script, basestring):
-                self.marionette.execute_script(self.test_script, script_args=self.test_script_args)
-        else:
-            # assumes the tests are started on startup automatically
-            pass
+    def start_tests(self):
+        # run the script that starts the tests
+        if os.path.isfile(self.test_script):
+            script = open(self.test_script, 'r')
+            self.marionette.execute_script(script.read(), script_args=self.test_script_args)
+            script.close()
+        elif isinstance(self.test_script, basestring):
+            self.marionette.execute_script(self.test_script, script_args=self.test_script_args)
 
     def on_output(self, line):
-        print line
         match = re.findall(r"TEST-START \| ([^\s]*)", line)
         if match:
             self.last_test = match[-1]
 
     def on_timeout(self):
+        self.dm.killProcess('/system/b2g/b2g', sig=signal.SIGABRT)
+
         msg = "%s | application timed out after %s seconds"
 
         if self.timeout:
@@ -199,28 +245,7 @@ class B2GRunner(RemoteRunner):
             msg = "%s with no output" % msg
 
         self.log.testFail(msg % (self.last_test, timeout))
-        self.dm.killProcess('/system/b2g/b2g', sig=signal.SIGABRT)
         self.check_for_crashes()
-
-    def _reboot_device(self):
-        serial, status = self._get_device_status()
-        self.dm.shellCheckOutput(['/system/bin/reboot'])
-
-        # The reboot command can return while adb still thinks the device is
-        # connected, so wait a little bit for it to disconnect from adb.
-        time.sleep(10)
-
-        # wait for device to come back to previous status
-        self.log.info('waiting for device to come back online after reboot')
-        start = time.time()
-        rserial, rstatus = self._get_device_status(serial)
-        while rstatus != 'device':
-            if time.time() - start > 120:
-                # device hasn't come back online in 2 minutes, something's wrong
-                raise Exception("Device %s (status: %s) not back online after reboot" % (serial, rstatus))
-            time.sleep(5)
-            rserial, rstatus = self.getDeviceStatus(serial)
-        self.log.info('device:', serial, 'status:', rstatus)
 
     def _get_device_status(self, serial=None):
         # If we know the device serial number, we look for that,
@@ -245,7 +270,7 @@ class B2GRunner(RemoteRunner):
         active = False
         time_out = 0
         while not active and time_out < 40:
-            proc = subprocess.Popen([self.dm._adbPath, 'shell', '/system/bin/netcfg'])
+            proc = subprocess.Popen([self.dm._adbPath, 'shell', '/system/bin/netcfg'], stdout=subprocess.PIPE)
             proc.stdout.readline() # ignore first line
             line = proc.stdout.readline()
             while line != "":
@@ -258,9 +283,8 @@ class B2GRunner(RemoteRunner):
         return active
 
     def _setup_remote_profile(self):
-        """
-        Copy profile and update the remote profiles ini file to point to the new profile
-        """
+        """Copy profile and update the remote profiles.ini to point to the new profile"""
+        self.dm.remount()
 
         # copy the profile to the device.
         if self.dm.dirExists(self.remote_profile):
@@ -276,10 +300,10 @@ class B2GRunner(RemoteRunner):
         if os.path.isdir(extension_dir):
             # Copy the extensions to the B2G bundles dir.
             # need to write to read-only dir
-            subprocess.Popen([self.dm._adbPath, 'remount']).communicate()
             for filename in os.listdir(extension_dir):
-                self.dm.shellCheckOutput(['rm', '-rf',
-                                          os.path.join(self.bundles_dir, filename)])
+                fpath = os.path.join(self.bundles_dir, filename)
+                if self.dm.fileExists(fpath):
+                    self.dm.shellCheckOutput(['rm', '-rf', fpath])
             try:
                 self.dm.pushDir(extension_dir, self.bundles_dir)
             except DMError:
@@ -311,15 +335,19 @@ class B2GRunner(RemoteRunner):
         self.dm.pushFile(os.path.join(self.profile.profile, "user.js"), self.user_js)
 
     def cleanup(self):
-        super(B2GRunner, self).cleanup()
+        RemoteRunner.cleanup(self)
         if getattr(self.marionette, 'instance', False):
             self.marionette.instance.close()
         del self.marionette
 
+
 class ProfileConfigParser(ConfigParser.RawConfigParser):
-    """Subclass of RawConfigParser that outputs .ini files in the exact
-       format expected for profiles.ini, which is slightly different
-       than the default format.
+    """Class to create profiles.ini config files
+
+    Subclass of RawConfigParser that outputs .ini files in the exact
+    format expected for profiles.ini, which is slightly different
+    than the default format.
+
     """
 
     def optionxform(self, optionstr):

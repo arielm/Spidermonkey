@@ -189,7 +189,7 @@ JS::Utf8ToOneUcs4Char(const uint8_t *utf8Buffer, int utf8Length)
         ucs4Char = (ucs4Char << 6) | (*utf8Buffer++ & 0x3F);
     }
 
-    if (JS_UNLIKELY(ucs4Char < minucs4Char || (ucs4Char >= 0xD800 && ucs4Char <= 0xDFFF)))
+    if (MOZ_UNLIKELY(ucs4Char < minucs4Char || (ucs4Char >= 0xD800 && ucs4Char <= 0xDFFF)))
         return INVALID_UTF8;
 
     return ucs4Char;
@@ -333,9 +333,6 @@ typedef bool (*CountAction)(JSContext *, const UTF8Chars, jschar *, size_t *, bo
 static TwoByteCharsZ
 InflateUTF8StringHelper(JSContext *cx, const UTF8Chars src, CountAction countAction, size_t *outlen)
 {
-    // Malformed UTF8 chars could trigger errors and hence GC.
-    MaybeCheckStackRoots(cx);
-
     *outlen = 0;
 
     bool isAscii;

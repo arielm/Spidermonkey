@@ -35,6 +35,20 @@ class MacroAssemblerARM : public Assembler
     // baseline IC stubs rely on lr holding the return address.
     Register secondScratchReg_;
 
+    // higher level tag testing code
+    Operand ToPayload(Operand base) {
+        return Operand(Register::FromCode(base.base()), base.disp());
+    }
+    Address ToPayload(Address base) {
+        return ToPayload(Operand(base)).toAddress();
+    }
+    Operand ToType(Operand base) {
+        return Operand(Register::FromCode(base.base()), base.disp() + sizeof(void *));
+    }
+    Address ToType(Address base) {
+        return ToType(Operand(base)).toAddress();
+    }
+
   public:
     MacroAssemblerARM()
       : secondScratchReg_(lr)
@@ -50,14 +64,15 @@ class MacroAssemblerARM : public Assembler
     void convertInt32ToDouble(const Address &src, FloatRegister dest);
     void convertUInt32ToFloat32(const Register &src, const FloatRegister &dest);
     void convertUInt32ToDouble(const Register &src, const FloatRegister &dest);
-    void convertDoubleToFloat(const FloatRegister &src, const FloatRegister &dest);
+    void convertDoubleToFloat32(const FloatRegister &src, const FloatRegister &dest,
+                                Condition c = Always);
     void branchTruncateDouble(const FloatRegister &src, const Register &dest, Label *fail);
     void convertDoubleToInt32(const FloatRegister &src, const Register &dest, Label *fail,
                               bool negativeZeroCheck = true);
     void convertFloat32ToInt32(const FloatRegister &src, const Register &dest, Label *fail,
                                bool negativeZeroCheck = true);
 
-    void convertFloatToDouble(const FloatRegister &src, const FloatRegister &dest);
+    void convertFloat32ToDouble(const FloatRegister &src, const FloatRegister &dest);
     void branchTruncateFloat32(const FloatRegister &src, const Register &dest, Label *fail);
     void convertInt32ToFloat32(const Register &src, const FloatRegister &dest);
     void convertInt32ToFloat32(const Address &src, FloatRegister dest);
@@ -248,7 +263,8 @@ class MacroAssemblerARM : public Assembler
 
     // fast mod, uses scratch registers, and thus needs to be in the assembler
     // implicitly assumes that we can overwrite dest at the beginning of the sequence
-    void ma_mod_mask(Register src, Register dest, Register hold, int32_t shift);
+    void ma_mod_mask(Register src, Register dest, Register hold, Register tmp,
+                     int32_t shift);
 
     // mod, depends on integer divide instructions being supported
     void ma_smod(Register num, Register div, Register dest);
@@ -297,7 +313,7 @@ class MacroAssemblerARM : public Assembler
     void ma_vpush(VFPRegister r);
 
     // branches when done from within arm-specific code
-    void ma_b(Label *dest, Condition c = Always, bool isPatchable = false);
+    BufferOffset ma_b(Label *dest, Condition c = Always, bool isPatchable = false);
     void ma_bx(Register dest, Condition c = Always);
 
     void ma_b(void *target, Relocation::Kind reloc, Condition c = Always);
@@ -317,6 +333,7 @@ class MacroAssemblerARM : public Assembler
 
     void ma_vneg(FloatRegister src, FloatRegister dest, Condition cc = Always);
     void ma_vmov(FloatRegister src, FloatRegister dest, Condition cc = Always);
+    void ma_vmov_f32(FloatRegister src, FloatRegister dest, Condition cc = Always);
     void ma_vabs(FloatRegister src, FloatRegister dest, Condition cc = Always);
     void ma_vabs_f32(FloatRegister src, FloatRegister dest, Condition cc = Always);
 
@@ -383,6 +400,9 @@ class MacroAssemblerARM : public Assembler
 
     void ma_call(ImmPtr dest);
 
+    // calls reg, storing the return address into sp[0]
+    void ma_callAndStoreRet(const Register reg, uint32_t stackArgBytes);
+
     // Float registers can only be loaded/stored in continuous runs
     // when using vstm/vldm.
     // This function breaks set into continuous runs and loads/stores
@@ -441,19 +461,19 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     // The actual number of arguments that were passed, used to assert that
     // the initial number of arguments declared was correct.
     uint32_t passedArgs_;
+    uint32_t passedArgTypes_;
 
-#ifdef JS_CPU_ARM_HARDFP
-    uint32_t usedIntSlots_;
-    uint32_t usedFloatSlots_;
-    uint32_t padding_;
-#else
     // ARM treats arguments as a vector in registers/memory, that looks like:
     // { r0, r1, r2, r3, [sp], [sp,+4], [sp,+8] ... }
-    // usedSlots_ keeps track of how many of these have been used.
+    // usedIntSlots_ keeps track of how many of these have been used.
     // It bears a passing resemblance to passedArgs_, but a single argument
     // can effectively use between one and three slots depending on its size and
     // alignment requirements
-    uint32_t usedSlots_;
+    uint32_t usedIntSlots_;
+#if defined(JS_CODEGEN_ARM_HARDFP) || defined(JS_ARM_SIMULATOR)
+    uint32_t usedFloatSlots_;
+    bool usedFloat32_;
+    uint32_t padding_;
 #endif
     bool dynamicAlignment_;
 
@@ -461,8 +481,8 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
 
     // Used to work around the move resolver's lack of support for
     // moving into register pairs, which the softfp ABI needs.
-    MoveResolver::MoveOperand floatArgsInGPR[2];
-    bool floatArgsInGPRValid[2];
+    mozilla::Array<MoveOperand, 2> floatArgsInGPR;
+    mozilla::Array<bool, 2> floatArgsInGPRValid;
 
     // Compute space needed for the function call and set the properties of the
     // callee.  It returns the space which has to be allocated for calling the
@@ -484,15 +504,6 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         setFramePushed(framePushed_ + value);
     }
   public:
-    typedef MoveResolver::MoveOperand MoveOperand;
-    typedef MoveResolver::Move Move;
-
-    enum Result {
-        GENERAL,
-        DOUBLE,
-        FLOAT
-    };
-
     MacroAssemblerARMCompat()
       : inCall_(false),
         enoughMemory_(true),
@@ -536,7 +547,6 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void call(const Register reg) {
         as_blx(reg);
     }
-
     void call(Label *label) {
         // for now, assume that it'll be nearby?
         as_bl(label, Always);
@@ -553,9 +563,9 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         movePtr(imm, CallReg);
         call(CallReg);
     }
-    void call(IonCode *c) {
+    void call(JitCode *c) {
         BufferOffset bo = m_buffer.nextOffset();
-        addPendingJump(bo, ImmPtr(c->raw()), Relocation::IONCODE);
+        addPendingJump(bo, ImmPtr(c->raw()), Relocation::JITCODE);
         RelocStyle rs;
         if (hasMOVWT())
             rs = L_MOVWT;
@@ -565,9 +575,41 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         ma_movPatchable(ImmPtr(c->raw()), ScratchRegister, Always, rs);
         ma_callIonHalfPush(ScratchRegister);
     }
-    void branch(IonCode *c) {
+
+    void appendCallSite(const CallSiteDesc &desc) {
+        enoughMemory_ &= append(CallSite(desc, currentOffset(), framePushed_));
+    }
+
+    void call(const CallSiteDesc &desc, const Register reg) {
+        call(reg);
+        appendCallSite(desc);
+    }
+    void call(const CallSiteDesc &desc, Label *label) {
+        call(label);
+        appendCallSite(desc);
+    }
+    void call(const CallSiteDesc &desc, AsmJSImmPtr imm) {
+        call(imm);
+        appendCallSite(desc);
+    }
+    void callExit(AsmJSImmPtr imm, uint32_t stackArgBytes) {
+        movePtr(imm, CallReg);
+        ma_callAndStoreRet(CallReg, stackArgBytes);
+        appendCallSite(CallSiteDesc::Exit());
+    }
+    void callIonFromAsmJS(const Register reg) {
+        ma_callIonNoPush(reg);
+        appendCallSite(CallSiteDesc::Exit());
+
+        // The Ion ABI has the callee pop the return address off the stack.
+        // The asm.js caller assumes that the call leaves sp unchanged, so bump
+        // the stack.
+        subPtr(Imm32(sizeof(void*)), sp);
+    }
+
+    void branch(JitCode *c) {
         BufferOffset bo = m_buffer.nextOffset();
-        addPendingJump(bo, ImmPtr(c->raw()), Relocation::IONCODE);
+        addPendingJump(bo, ImmPtr(c->raw()), Relocation::JITCODE);
         RelocStyle rs;
         if (hasMOVWT())
             rs = L_MOVWT;
@@ -641,7 +683,7 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
 
     // Emit a BLX or NOP instruction. ToggleCall can be used to patch
     // this instruction.
-    CodeOffsetLabel toggledCall(IonCode *target, bool enabled);
+    CodeOffsetLabel toggledCall(JitCode *target, bool enabled);
 
     static size_t ToggledCallSize() {
         if (hasMOVWT())
@@ -685,6 +727,9 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     }
     void test32(Register lhs, Register rhs) {
         ma_tst(lhs, rhs);
+    }
+    void test32(Register lhs, Imm32 imm) {
+        ma_tst(lhs, imm);
     }
     void test32(const Address &address, Imm32 imm) {
         ma_ldr(Operand(address.base, address.offset), ScratchRegister);
@@ -846,8 +891,9 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         if (lhs.getTag() == Operand::OP2) {
             branch32(cond, lhs.toReg(), rhs, label);
         } else {
-            ma_ldr(lhs, ScratchRegister);
-            branch32(cond, ScratchRegister, rhs, label);
+            // branch32 will use ScratchRegister.
+            ma_ldr(lhs, secondScratchReg_);
+            branch32(cond, secondScratchReg_, rhs, label);
         }
     }
     void branch32(Condition cond, const Address &lhs, Register rhs, Label *label) {
@@ -855,8 +901,9 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         branch32(cond, ScratchRegister, rhs, label);
     }
     void branch32(Condition cond, const Address &lhs, Imm32 rhs, Label *label) {
-        load32(lhs, ScratchRegister);
-        branch32(cond, ScratchRegister, rhs, label);
+        // branch32 will use ScratchRegister.
+        load32(lhs, secondScratchReg_);
+        branch32(cond, secondScratchReg_, rhs, label);
     }
     void branchPtr(Condition cond, const Address &lhs, Register rhs, Label *label) {
         branch32(cond, lhs, rhs, label);
@@ -920,9 +967,20 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         branch32(cond, val.payloadReg(), Imm32(static_cast<int32_t>(why)), label);
         bind(&notmagic);
     }
-    template<typename T>
-    void branchTestBooleanTruthy(bool b, const T & t, Label *label) {
-        Condition c = testBooleanTruthy(b, t);
+    void branchTestInt32Truthy(bool truthy, const ValueOperand &operand, Label *label) {
+        Condition c = testInt32Truthy(truthy, operand);
+        ma_b(label, c);
+    }
+    void branchTestBooleanTruthy(bool truthy, const ValueOperand &operand, Label *label) {
+        Condition c = testBooleanTruthy(truthy, operand);
+        ma_b(label, c);
+    }
+    void branchTestDoubleTruthy(bool truthy, const FloatRegister &reg, Label *label) {
+        Condition c = testDoubleTruthy(truthy, reg);
+        ma_b(label, c);
+    }
+    void branchTestStringTruthy(bool truthy, const ValueOperand &value, Label *label) {
+        Condition c = testStringTruthy(truthy, value);
         ma_b(label, c);
     }
     void branchTest32(Condition cond, const Register &lhs, const Register &rhs, Label *label) {
@@ -939,8 +997,9 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         ma_b(label, cond);
     }
     void branchTest32(Condition cond, const Address &address, Imm32 imm, Label *label) {
-        ma_ldr(Operand(address.base, address.offset), ScratchRegister);
-        branchTest32(cond, ScratchRegister, imm, label);
+        // branchTest32 will use ScratchRegister.
+        load32(address, secondScratchReg_);
+        branchTest32(cond, secondScratchReg_, imm, label);
     }
     void branchTestPtr(Condition cond, const Register &lhs, const Register &rhs, Label *label) {
         branchTest32(cond, lhs, rhs, label);
@@ -967,6 +1026,9 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void branchPtr(Condition cond, Register lhs, AsmJSImmPtr imm, Label *label) {
         movePtr(imm, ScratchRegister);
         branchPtr(cond, lhs, ScratchRegister, label);
+    }
+    void branchPtr(Condition cond, Register lhs, Imm32 imm, Label *label) {
+        branch32(cond, lhs, imm, label);
     }
     void decBranchPtr(Condition cond, const Register &lhs, Imm32 imm, Label *label) {
         subPtr(imm, lhs);
@@ -1150,22 +1212,22 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     // The following functions are exposed for use in platform-shared code.
     void Push(const Register &reg) {
         ma_push(reg);
-        adjustFrame(STACK_SLOT_SIZE);
+        adjustFrame(sizeof(intptr_t));
     }
     void Push(const Imm32 imm) {
         push(imm);
-        adjustFrame(STACK_SLOT_SIZE);
+        adjustFrame(sizeof(intptr_t));
     }
     void Push(const ImmWord imm) {
         push(imm);
-        adjustFrame(STACK_SLOT_SIZE);
+        adjustFrame(sizeof(intptr_t));
     }
     void Push(const ImmPtr imm) {
         Push(ImmWord(uintptr_t(imm.value)));
     }
     void Push(const ImmGCPtr ptr) {
         push(ptr);
-        adjustFrame(STACK_SLOT_SIZE);
+        adjustFrame(sizeof(intptr_t));
     }
     void Push(const FloatRegister &t) {
         VFPRegister r = VFPRegister(t);
@@ -1183,19 +1245,19 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
 
     void PushWithPadding(const Register &reg, const Imm32 extraSpace) {
         pushWithPadding(reg, extraSpace);
-        adjustFrame(STACK_SLOT_SIZE + extraSpace.value);
+        adjustFrame(sizeof(intptr_t) + extraSpace.value);
     }
     void PushWithPadding(const Imm32 imm, const Imm32 extraSpace) {
         pushWithPadding(imm, extraSpace);
-        adjustFrame(STACK_SLOT_SIZE + extraSpace.value);
+        adjustFrame(sizeof(intptr_t) + extraSpace.value);
     }
 
     void Pop(const Register &reg) {
         ma_pop(reg);
-        adjustFrame(-STACK_SLOT_SIZE);
+        adjustFrame(-sizeof(intptr_t));
     }
     void implicitPop(uint32_t args) {
-        JS_ASSERT(args % STACK_SLOT_SIZE == 0);
+        JS_ASSERT(args % sizeof(intptr_t) == 0);
         adjustFrame(-args);
     }
     uint32_t framePushed() const {
@@ -1209,8 +1271,8 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     // non-function. Returns offset to be passed to markSafepointAt().
     bool buildFakeExitFrame(const Register &scratch, uint32_t *offset);
 
-    void callWithExitFrame(IonCode *target);
-    void callWithExitFrame(IonCode *target, Register dynStack);
+    void callWithExitFrame(JitCode *target);
+    void callWithExitFrame(JitCode *target, Register dynStack);
 
     // Makes an Ion call using the only two methods that it is sane for
     // indep code to make a call
@@ -1225,6 +1287,16 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void add32(Imm32 imm, const Address &dest);
     void sub32(Imm32 imm, Register dest);
     void sub32(Register src, Register dest);
+    template <typename T>
+    void branchAdd32(Condition cond, T src, Register dest, Label *label) {
+        add32(src, dest);
+        j(cond, label);
+    }
+    template <typename T>
+    void branchSub32(Condition cond, T src, Register dest, Label *label) {
+        sub32(src, dest);
+        j(cond, label);
+    }
     void xor32(Imm32 imm, Register dest);
 
     void and32(Imm32 imm, Register dest);
@@ -1238,6 +1310,7 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void andPtr(Register src, Register dest);
     void addPtr(Register src, Register dest);
     void addPtr(const Address &src, Register dest);
+    void not32(Register reg);
 
     void move32(const Imm32 &imm, const Register &dest);
     void move32(const Register &src, const Register &dest);
@@ -1278,8 +1351,8 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void loadFloatAsDouble(const Address &addr, const FloatRegister &dest);
     void loadFloatAsDouble(const BaseIndex &src, const FloatRegister &dest);
 
-    void loadFloat(const Address &addr, const FloatRegister &dest);
-    void loadFloat(const BaseIndex &src, const FloatRegister &dest);
+    void loadFloat32(const Address &addr, const FloatRegister &dest);
+    void loadFloat32(const BaseIndex &src, const FloatRegister &dest);
 
     void store8(const Register &src, const Address &address);
     void store8(const Imm32 &imm, const Address &address);
@@ -1315,10 +1388,10 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         ma_vmov(src, dest);
     }
 
-    void storeFloat(FloatRegister src, Address addr) {
+    void storeFloat32(FloatRegister src, Address addr) {
         ma_vstr(VFPRegister(src).singleOverlay(), Operand(addr));
     }
-    void storeFloat(FloatRegister src, BaseIndex addr) {
+    void storeFloat32(FloatRegister src, BaseIndex addr) {
         // Harder cases not handled yet.
         JS_ASSERT(addr.offset == 0);
         uint32_t scale = Imm32::ShiftOf(addr.scale).value;
@@ -1342,6 +1415,7 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void cmpPtr(const Register &lhs, const ImmPtr &rhs);
     void cmpPtr(const Register &lhs, const Register &rhs);
     void cmpPtr(const Register &lhs, const ImmGCPtr &rhs);
+    void cmpPtr(const Register &lhs, const Imm32 &rhs);
     void cmpPtr(const Address &lhs, const Register &rhs);
     void cmpPtr(const Address &lhs, const ImmWord &rhs);
     void cmpPtr(const Address &lhs, const ImmPtr &rhs);
@@ -1349,6 +1423,7 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void subPtr(Imm32 imm, const Register dest);
     void subPtr(const Address &addr, const Register dest);
     void subPtr(const Register &src, const Register &dest);
+    void subPtr(const Register &src, const Address &dest);
     void addPtr(Imm32 imm, const Register dest);
     void addPtr(Imm32 imm, const Address &dest);
     void addPtr(ImmWord imm, const Register dest) {
@@ -1392,6 +1467,28 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         ma_mov(Imm32(1), dest, NoSetCond, cond);
     }
 
+    template <typename T1, typename T2>
+    void cmpPtrSet(Assembler::Condition cond, T1 lhs, T2 rhs, const Register &dest)
+    {
+        cmpPtr(lhs, rhs);
+        emitSet(cond, dest);
+    }
+    template <typename T1, typename T2>
+    void cmp32Set(Assembler::Condition cond, T1 lhs, T2 rhs, const Register &dest)
+    {
+        cmp32(lhs, rhs);
+        emitSet(cond, dest);
+    }
+
+    void testNullSet(Condition cond, const ValueOperand &value, Register dest) {
+        cond = testNull(cond, value);
+        emitSet(cond, dest);
+    }
+    void testUndefinedSet(Condition cond, const ValueOperand &value, Register dest) {
+        cond = testUndefined(cond, value);
+        emitSet(cond, dest);
+    }
+
     // Setup a call to C/C++ code, given the number of general arguments it
     // takes. Note that this only supports cdecl.
     //
@@ -1410,23 +1507,27 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     // automatically adjusted. It is extremely important that esp-relative
     // addresses are computed *after* setupABICall(). Furthermore, no
     // operations should be emitted while setting arguments.
-    void passABIArg(const MoveOperand &from);
+    void passABIArg(const MoveOperand &from, MoveOp::Type type);
     void passABIArg(const Register &reg);
-    void passABIArg(const FloatRegister &reg);
+    void passABIArg(const FloatRegister &reg, MoveOp::Type type);
     void passABIArg(const ValueOperand &regs);
+
+  private:
+    void passHardFpABIArg(const MoveOperand &from, MoveOp::Type type);
+    void passSoftFpABIArg(const MoveOperand &from, MoveOp::Type type);
 
   protected:
     bool buildOOLFakeExitFrame(void *fakeReturnAddr);
 
   private:
     void callWithABIPre(uint32_t *stackAdjust);
-    void callWithABIPost(uint32_t stackAdjust, Result result);
+    void callWithABIPost(uint32_t stackAdjust, MoveOp::Type result);
 
   public:
     // Emits a call to a C/C++ function, resolving all argument moves.
-    void callWithABI(void *fun, Result result = GENERAL);
-    void callWithABI(AsmJSImmPtr imm, Result result = GENERAL);
-    void callWithABI(const Address &fun, Result result = GENERAL);
+    void callWithABI(void *fun, MoveOp::Type result = MoveOp::GENERAL);
+    void callWithABI(AsmJSImmPtr imm, MoveOp::Type result = MoveOp::GENERAL);
+    void callWithABI(const Address &fun, MoveOp::Type result = MoveOp::GENERAL);
 
     CodeOffsetLabel labelForPatch() {
         return CodeOffsetLabel(nextOffset().getOffset());
@@ -1443,6 +1544,7 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
     void floor(FloatRegister input, Register output, Label *handleNotAnInt);
     void floorf(FloatRegister input, Register output, Label *handleNotAnInt);
     void round(FloatRegister input, Register output, Label *handleNotAnInt, FloatRegister tmp);
+    void roundf(FloatRegister input, Register output, Label *handleNotAnInt, FloatRegister tmp);
 
     void clampCheck(Register r, Label *handleNotAnInt) {
         // check explicitly for r == INT_MIN || r == INT_MAX
@@ -1453,7 +1555,6 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         ma_b(handleNotAnInt, Above);
     }
 
-    void enterOsr(Register calleeToken, Register code);
     void memIntToValue(Address Source, Address Dest) {
         load32(Source, lr);
         storeValue(JSVAL_TYPE_INT32, lr, Dest);
@@ -1493,14 +1594,14 @@ class MacroAssemblerARMCompat : public MacroAssemblerARM
         return as_cmp(bounded, Imm8(0));
     }
 
-    void storeFloat(VFPRegister src, Register base, Register index, Condition cond) {
-        as_vcvt(VFPRegister(ScratchFloatReg).singleOverlay(), src, false, cond);
-        ma_vstr(VFPRegister(ScratchFloatReg).singleOverlay(), base, index, 0, cond);
+    void moveFloat32(FloatRegister src, FloatRegister dest) {
+        as_vmov(VFPRegister(dest).singleOverlay(), VFPRegister(src).singleOverlay());
+    }
 
-    }
-    void moveFloat(FloatRegister src, FloatRegister dest) {
-        as_vmov(VFPRegister(src).singleOverlay(), VFPRegister(dest).singleOverlay());
-    }
+#ifdef JSGC_GENERATIONAL
+    void branchPtrInNurseryRange(Register ptr, Register temp, Label *label);
+    void branchValueIsNurseryObject(ValueOperand value, Register temp, Label *label);
+#endif
 };
 
 typedef MacroAssemblerARMCompat MacroAssemblerSpecific;

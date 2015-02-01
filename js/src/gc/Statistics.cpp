@@ -239,8 +239,8 @@ class gcstats::StatisticsSerializer
  */
 JS_STATIC_ASSERT(JS::gcreason::NUM_TELEMETRY_REASONS >= JS::gcreason::NUM_REASONS);
 
-static const char *
-ExplainReason(JS::gcreason::Reason reason)
+const char *
+js::gcstats::ExplainReason(JS::gcreason::Reason reason)
 {
     switch (reason) {
 #define SWITCH_REASON(name)                     \
@@ -276,7 +276,6 @@ static const PhaseInfo phases[] = {
     { PHASE_PURGE, "Purge", PHASE_NO_PARENT },
     { PHASE_MARK, "Mark", PHASE_NO_PARENT },
     { PHASE_MARK_ROOTS, "Mark Roots", PHASE_MARK },
-    { PHASE_MARK_TYPES, "Mark Types", PHASE_MARK_ROOTS },
     { PHASE_MARK_DELAYED, "Mark Delayed", PHASE_MARK },
     { PHASE_SWEEP, "Sweep", PHASE_NO_PARENT },
     { PHASE_SWEEP_MARK, "Mark During Sweeping", PHASE_SWEEP },
@@ -301,12 +300,11 @@ static const PhaseInfo phases[] = {
     { PHASE_DISCARD_TI, "Discard TI", PHASE_DISCARD_ANALYSIS },
     { PHASE_FREE_TI_ARENA, "Free TI Arena", PHASE_DISCARD_ANALYSIS },
     { PHASE_SWEEP_TYPES, "Sweep Types", PHASE_DISCARD_ANALYSIS },
-    { PHASE_CLEAR_SCRIPT_ANALYSIS, "Clear Script Analysis", PHASE_DISCARD_ANALYSIS },
     { PHASE_SWEEP_OBJECT, "Sweep Object", PHASE_SWEEP },
     { PHASE_SWEEP_STRING, "Sweep String", PHASE_SWEEP },
     { PHASE_SWEEP_SCRIPT, "Sweep Script", PHASE_SWEEP },
     { PHASE_SWEEP_SHAPE, "Sweep Shape", PHASE_SWEEP },
-    { PHASE_SWEEP_IONCODE, "Sweep Ion code", PHASE_SWEEP },
+    { PHASE_SWEEP_JITCODE, "Sweep JIT code", PHASE_SWEEP },
     { PHASE_FINALIZE_END, "Finalize End Callback", PHASE_SWEEP },
     { PHASE_DESTROY, "Deallocate", PHASE_SWEEP },
     { PHASE_GC_END, "End Callback", PHASE_NO_PARENT },
@@ -366,6 +364,7 @@ Statistics::formatData(StatisticsSerializer &ss, uint64_t timestamp)
     ss.appendNumber("Zones Collected", "%d", "", collectedCount);
     ss.appendNumber("Total Zones", "%d", "", zoneCount);
     ss.appendNumber("Total Compartments", "%d", "", compartmentCount);
+    ss.appendNumber("Minor GCs", "%d", "", counts[STAT_MINOR_GC]);
     ss.appendNumber("MMU (20ms)", "%d", "%", int(mmu20 * 100));
     ss.appendNumber("MMU (50ms)", "%d", "%", int(mmu50 * 100));
     ss.appendDecimal("SCC Sweep Total", "ms", t(sccTotal));

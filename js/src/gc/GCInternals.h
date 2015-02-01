@@ -96,11 +96,6 @@ class IncrementalSafety
 IncrementalSafety
 IsIncrementalGCSafe(JSRuntime *rt);
 
-#ifdef JSGC_ROOT_ANALYSIS
-void *
-GetAddressableGCThing(JSRuntime *rt, uintptr_t w);
-#endif
-
 #ifdef JS_GC_ZEAL
 void
 StartVerifyPreBarriers(JSRuntime *rt);
@@ -126,11 +121,11 @@ class AutoStopVerifyingBarriers
 
   public:
     AutoStopVerifyingBarriers(JSRuntime *rt, bool isShutdown
-                       MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
+                              MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
       : runtime(rt)
     {
         restartPreVerifier = !isShutdown && rt->gcVerifyPreData;
-        restartPostVerifier = !isShutdown && rt->gcVerifyPostData && rt->gcGenerationalEnabled;
+        restartPostVerifier = !isShutdown && rt->gcVerifyPostData && JS::IsGenerationalGCEnabled(rt);
         if (rt->gcVerifyPreData)
             EndVerifyPreBarriers(rt);
         if (rt->gcVerifyPostData)

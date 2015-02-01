@@ -14,12 +14,6 @@
 #include "mozilla/PodOperations.h"
 #include "mozilla/RangedPtr.h"
 
-#ifdef XP_OS2
-#define _PC_53  PC_53
-#define _MCW_EM MCW_EM
-#define _MCW_PC MCW_PC
-#endif
-
 #ifdef HAVE_LOCALECONV
 #include <locale.h>
 #endif
@@ -47,7 +41,7 @@ using namespace js;
 using namespace js::types;
 
 using mozilla::Abs;
-using mozilla::MinDoubleValue;
+using mozilla::MinNumberValue;
 using mozilla::NegativeInfinity;
 using mozilla::PodCopy;
 using mozilla::PositiveInfinity;
@@ -488,7 +482,7 @@ Number(JSContext *cx, unsigned argc, Value *vp)
     return true;
 }
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 IsNumber(HandleValue v)
 {
     return v.isNumber() || (v.isObject() && v.toObject().is<NumberObject>());
@@ -503,7 +497,7 @@ Extract(const Value &v)
 }
 
 #if JS_HAS_TOSOURCE
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 num_toSource_impl(JSContext *cx, CallArgs args)
 {
     double d = Extract(args.thisv());
@@ -541,7 +535,7 @@ ToCStringBuf::~ToCStringBuf()
     js_free(dbuf);
 }
 
-JS_ALWAYS_INLINE
+MOZ_ALWAYS_INLINE
 static JSFlatString *
 LookupDtoaCache(ThreadSafeContext *cx, double d)
 {
@@ -556,7 +550,7 @@ LookupDtoaCache(ThreadSafeContext *cx, double d)
     return nullptr;
 }
 
-JS_ALWAYS_INLINE
+MOZ_ALWAYS_INLINE
 static void
 CacheNumber(ThreadSafeContext *cx, double d, JSFlatString *str)
 {
@@ -567,7 +561,7 @@ CacheNumber(ThreadSafeContext *cx, double d, JSFlatString *str)
         comp->dtoaCache.cache(10, d, str);
 }
 
-JS_ALWAYS_INLINE
+MOZ_ALWAYS_INLINE
 static JSFlatString *
 LookupInt32ToString(ThreadSafeContext *cx, int32_t si)
 {
@@ -578,7 +572,7 @@ LookupInt32ToString(ThreadSafeContext *cx, int32_t si)
 }
 
 template <typename T>
-JS_ALWAYS_INLINE
+MOZ_ALWAYS_INLINE
 static T *
 BackfillInt32InBuffer(int32_t si, T *buffer, size_t size, size_t *length)
 {
@@ -602,14 +596,14 @@ js::Int32ToString(ThreadSafeContext *cx, int32_t si)
     if (JSFlatString *str = LookupInt32ToString(cx, si))
         return str;
 
-    JSShortString *str = js_NewGCShortString<allowGC>(cx);
+    JSFatInlineString *str = js_NewGCFatInlineString<allowGC>(cx);
     if (!str)
         return nullptr;
 
-    jschar buffer[JSShortString::MAX_SHORT_LENGTH + 1];
+    jschar buffer[JSFatInlineString::MAX_FAT_INLINE_LENGTH + 1];
     size_t length;
     jschar *start = BackfillInt32InBuffer(si, buffer,
-                                          JSShortString::MAX_SHORT_LENGTH + 1, &length);
+                                          JSFatInlineString::MAX_FAT_INLINE_LENGTH + 1, &length);
 
     PodCopy(str->init(length), start, length + 1);
 
@@ -629,9 +623,9 @@ js::Int32ToAtom(ExclusiveContext *cx, int32_t si)
     if (JSFlatString *str = LookupInt32ToString(cx, si))
         return js::AtomizeString(cx, str);
 
-    char buffer[JSShortString::MAX_SHORT_LENGTH + 1];
+    char buffer[JSFatInlineString::MAX_FAT_INLINE_LENGTH + 1];
     size_t length;
-    char *start = BackfillInt32InBuffer(si, buffer, JSShortString::MAX_SHORT_LENGTH + 1, &length);
+    char *start = BackfillInt32InBuffer(si, buffer, JSFatInlineString::MAX_FAT_INLINE_LENGTH + 1, &length);
 
     JSAtom *atom = Atomize(cx, start, length);
     if (!atom)
@@ -683,7 +677,7 @@ template <AllowGC allowGC>
 static JSString * JS_FASTCALL
 js_NumberToStringWithBase(ThreadSafeContext *cx, double d, int base);
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 num_toString_impl(JSContext *cx, CallArgs args)
 {
     JS_ASSERT(IsNumber(args.thisv()));
@@ -720,7 +714,7 @@ js_num_toString(JSContext *cx, unsigned argc, Value *vp)
 }
 
 #if !EXPOSE_INTL_API
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 num_toLocaleString_impl(JSContext *cx, CallArgs args)
 {
     JS_ASSERT(IsNumber(args.thisv()));
@@ -854,7 +848,7 @@ num_toLocaleString(JSContext *cx, unsigned argc, Value *vp)
 }
 #endif /* !EXPOSE_INTL_API */
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 num_valueOf_impl(JSContext *cx, CallArgs args)
 {
     JS_ASSERT(IsNumber(args.thisv()));
@@ -909,7 +903,7 @@ DToStrResult(JSContext *cx, double d, JSDToStrMode mode, int precision, CallArgs
  * In the following three implementations, we allow a larger range of precision
  * than ECMA requires; this is permitted by ECMA-262.
  */
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 num_toFixed_impl(JSContext *cx, CallArgs args)
 {
     JS_ASSERT(IsNumber(args.thisv()));
@@ -932,7 +926,7 @@ num_toFixed(JSContext *cx, unsigned argc, Value *vp)
     return CallNonGenericMethod<IsNumber, num_toFixed_impl>(cx, args);
 }
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 num_toExponential_impl(JSContext *cx, CallArgs args)
 {
     JS_ASSERT(IsNumber(args.thisv()));
@@ -958,7 +952,7 @@ num_toExponential(JSContext *cx, unsigned argc, Value *vp)
     return CallNonGenericMethod<IsNumber, num_toExponential_impl>(cx, args);
 }
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 num_toPrecision_impl(JSContext *cx, CallArgs args)
 {
     JS_ASSERT(IsNumber(args.thisv()));
@@ -1086,6 +1080,8 @@ enum nc_slot {
     NC_NEGATIVE_INFINITY,
     NC_MAX_VALUE,
     NC_MIN_VALUE,
+    NC_MAX_SAFE_INTEGER,
+    NC_MIN_SAFE_INTEGER,
     NC_EPSILON,
     NC_LIMIT
 };
@@ -1101,6 +1097,10 @@ static JSConstDoubleSpec number_constants[] = {
     {0,                         "NEGATIVE_INFINITY", 0,{0,0,0}},
     {1.7976931348623157E+308,   "MAX_VALUE",         0,{0,0,0}},
     {0,                         "MIN_VALUE",         0,{0,0,0}},
+    /* ES6 (April 2014 draft) 20.1.2.6 */
+    {9007199254740991,          "MAX_SAFE_INTEGER",  0,{0,0,0}},
+    /* ES6 (April 2014 draft) 20.1.2.10 */
+    {-9007199254740991,         "MIN_SAFE_INTEGER",  0,{0,0,0}},
     /* ES6 (May 2013 draft) 15.7.3.7 */
     {2.2204460492503130808472633361816e-16, "EPSILON", 0,{0,0,0}},
     {0,0,0,{0,0,0}}
@@ -1138,10 +1138,10 @@ js::InitRuntimeNumberState(JSRuntime *rt)
      */
     number_constants[NC_NaN].dval = GenericNaN();
 
-    number_constants[NC_POSITIVE_INFINITY].dval = mozilla::PositiveInfinity();
-    number_constants[NC_NEGATIVE_INFINITY].dval = mozilla::NegativeInfinity();
+    number_constants[NC_POSITIVE_INFINITY].dval = mozilla::PositiveInfinity<double>();
+    number_constants[NC_NEGATIVE_INFINITY].dval = mozilla::NegativeInfinity<double>();
 
-    number_constants[NC_MIN_VALUE].dval = MinDoubleValue();
+    number_constants[NC_MIN_VALUE].dval = MinNumberValue<double>();
 
     // XXX If EXPOSE_INTL_API becomes true all the time at some point,
     //     js::InitRuntimeNumberState is no longer fallible, and we should
@@ -1249,15 +1249,15 @@ js_InitNumberClass(JSContext *cx, HandleObject obj)
     /* ES5 15.1.1.1, 15.1.1.2 */
     if (!DefineNativeProperty(cx, global, cx->names().NaN, valueNaN,
                               JS_PropertyStub, JS_StrictPropertyStub,
-                              JSPROP_PERMANENT | JSPROP_READONLY, 0, 0) ||
+                              JSPROP_PERMANENT | JSPROP_READONLY) ||
         !DefineNativeProperty(cx, global, cx->names().Infinity, valueInfinity,
                               JS_PropertyStub, JS_StrictPropertyStub,
-                              JSPROP_PERMANENT | JSPROP_READONLY, 0, 0))
+                              JSPROP_PERMANENT | JSPROP_READONLY))
     {
         return nullptr;
     }
 
-    if (!DefineConstructorAndPrototype(cx, global, JSProto_Number, ctor, numberProto))
+    if (!GlobalObject::initBuiltinConstructor(cx, global, JSProto_Number, ctor, numberProto))
         return nullptr;
 
     return numberProto;
@@ -1269,7 +1269,7 @@ FracNumberToCString(ThreadSafeContext *cx, ToCStringBuf *cbuf, double d, int bas
 #ifdef DEBUG
     {
         int32_t _;
-        JS_ASSERT(!mozilla::DoubleIsInt32(d, &_));
+        JS_ASSERT(!mozilla::NumberIsInt32(d, &_));
     }
 #endif
 
@@ -1298,7 +1298,7 @@ js::NumberToCString(JSContext *cx, ToCStringBuf *cbuf, double d, int base/* = 10
 {
     int32_t i;
     size_t len;
-    return mozilla::DoubleIsInt32(d, &i)
+    return mozilla::NumberIsInt32(d, &i)
            ? Int32ToCString(cbuf, i, &len, base)
            : FracNumberToCString(cx, cbuf, d, base);
 }
@@ -1323,7 +1323,7 @@ js_NumberToStringWithBase(ThreadSafeContext *cx, double d, int base)
                           : nullptr;
 
     int32_t i;
-    if (mozilla::DoubleIsInt32(d, &i)) {
+    if (mozilla::NumberIsInt32(d, &i)) {
         if (base == 10 && StaticStrings::hasInt(i))
             return cx->staticStrings().getInt(i);
         if (unsigned(i) < unsigned(base)) {
@@ -1384,7 +1384,7 @@ JSAtom *
 js::NumberToAtom(ExclusiveContext *cx, double d)
 {
     int32_t si;
-    if (mozilla::DoubleIsInt32(d, &si))
+    if (mozilla::NumberIsInt32(d, &si))
         return Int32ToAtom(cx, si);
 
     if (JSFlatString *str = LookupDtoaCache(cx, d))
@@ -1426,13 +1426,13 @@ js::IndexToString(JSContext *cx, uint32_t index)
     if (JSFlatString *str = c->dtoaCache.lookup(10, index))
         return str;
 
-    JSShortString *str = js_NewGCShortString<CanGC>(cx);
+    JSFatInlineString *str = js_NewGCFatInlineString<CanGC>(cx);
     if (!str)
         return nullptr;
 
-    jschar buffer[JSShortString::MAX_SHORT_LENGTH + 1];
-    RangedPtr<jschar> end(buffer + JSShortString::MAX_SHORT_LENGTH,
-                          buffer, JSShortString::MAX_SHORT_LENGTH + 1);
+    jschar buffer[JSFatInlineString::MAX_FAT_INLINE_LENGTH + 1];
+    RangedPtr<jschar> end(buffer + JSFatInlineString::MAX_FAT_INLINE_LENGTH,
+                          buffer, JSFatInlineString::MAX_FAT_INLINE_LENGTH + 1);
     *end = '\0';
     RangedPtr<jschar> start = BackfillIndexInCharBuffer(index, end);
 
@@ -1568,25 +1568,6 @@ js::NonObjectToNumberSlow(ThreadSafeContext *cx, Value v, double *out)
 bool
 js::ToNumberSlow(ExclusiveContext *cx, Value v, double *out)
 {
-#ifdef DEBUG
-    /*
-     * MSVC bizarrely miscompiles this, complaining about the first brace below
-     * being unmatched (!).  The error message points at both this opening brace
-     * and at the corresponding SkipRoot constructor.  The error seems to derive
-     * from the presence guard-object macros on the SkipRoot class/constructor,
-     * which seems well in the weeds for an unmatched-brace syntax error.
-     * Otherwise the problem is inscrutable, and I haven't found a workaround.
-     * So for now just disable it when compiling with MSVC -- not ideal, but at
-     * least Windows debug shell builds complete again.
-     */
-#ifndef _MSC_VER
-    {
-        SkipRoot skip(cx, &v);
-        MaybeCheckStackRoots(cx);
-    }
-#endif
-#endif
-
     JS_ASSERT(!v.isNumber());
     goto skip_int_double;
     for (;;) {
@@ -1788,7 +1769,7 @@ js_strtod(ThreadSafeContext *cx, const jschar *s, const jschar *send,
     if ((negative = (*istr == '-')) != 0 || *istr == '+')
         istr++;
     if (*istr == 'I' && !strncmp(istr, "Infinity", 8)) {
-        d = negative ? NegativeInfinity() : PositiveInfinity();
+        d = negative ? NegativeInfinity<double>() : PositiveInfinity<double>();
         estr = istr + 8;
     } else {
         int err;

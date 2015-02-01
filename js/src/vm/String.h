@@ -25,7 +25,6 @@ class JSDependentString;
 class JSExtensibleString;
 class JSExternalString;
 class JSInlineString;
-class JSStableString;
 class JSRope;
 
 namespace js {
@@ -70,7 +69,7 @@ static const size_t UINT32_CHAR_BUFFER_LENGTH = sizeof("4294967295") - 1;
  *
  *  - To avoid allocating small char arrays, short strings can be stored inline
  *    in the string header (JSInlineString). To increase the max size of such
- *    inline strings, extra-large string headers can be used (JSShortString).
+ *    inline strings, larger string headers can be used (JSFatInlineString).
  *
  *  - To avoid comparing O(n) string equality comparison, strings can be
  *    canonicalized to "atoms" (JSAtom) such that there is a single atom with a
@@ -96,8 +95,6 @@ static const size_t UINT32_CHAR_BUFFER_LENGTH = sizeof("4294967295") - 1;
  *  |
  * JSFlatString                 - / null terminated
  *  |  |
- *  |  +-- JSStableString       - / may have external pointers into char array
- *  |  |
  *  |  +-- JSExternalString     - / char array memory managed by embedding
  *  |  |
  *  |  +-- JSExtensibleString   capacity / no external pointers into char array
@@ -106,7 +103,7 @@ static const size_t UINT32_CHAR_BUFFER_LENGTH = sizeof("4294967295") - 1;
  *  |  |
  *  |  +-- JSInlineString       - / chars stored in header
  *  |         \
- *  |         JSShortString     - / header is fat
+ *  |         JSFatInlineString - / header is fat
  *  |
  * JSAtom                       - / string equality === pointer equality
  *  |
@@ -117,11 +114,12 @@ static const size_t UINT32_CHAR_BUFFER_LENGTH = sizeof("4294967295") - 1;
  * hierarchy), but have the same meaning: there are no strings with this type as
  * its most-derived type.
  *
- * Technically, there are three additional most-derived types that satisfy the
- * invariants of more than one of the abovementioned most-derived types:
- *  - InlineAtom = JSInlineString + JSAtom (atom with inline chars)
- *  - ShortAtom  = JSShortString  + JSAtom (atom with (more) inline chars)
- *  - StableAtom = JSStableString + JSAtom (atom with out-of-line chars)
+ * Atoms can additionally be permanent, i.e. unable to be collected, and can
+ * be combined with other string types to create additional most-derived types
+ * that satisfy the invariants of more than one of the abovementioned
+ * most-derived types:
+ *  - InlineAtom    = JSInlineString    + JSAtom (atom with inline chars)
+ *  - FatInlineAtom = JSFatInlineString + JSAtom (atom with (more) inline chars)
  *
  * Derived string types can be queried from ancestor types via isX() and
  * retrieved with asX() debug-only-checked casts.
@@ -144,7 +142,7 @@ class JSString : public js::gc::BarrieredCell<JSString>
             JSString               *left;               /* JSRope */
         } u1;
         union {
-            jschar                 inlineStorage[NUM_INLINE_CHARS]; /* JS(Inline|Short)String */
+            jschar                 inlineStorage[NUM_INLINE_CHARS]; /* JS(Inline|FatInline)String */
             struct {
                 union {
                     JSLinearString *base;               /* JS(Dependent|Undepended)String */
@@ -180,22 +178,20 @@ class JSString : public js::gc::BarrieredCell<JSString>
      * the predicate used to query whether a JSString instance is subtype
      * (reflexively) of that type.
      *
-     *   Rope         0000       0000
-     *   Linear       -         !0000
-     *   HasBase      -          xxx1
-     *   Dependent    0001       0001
-     *   Flat         -          isLinear && !isDependent
-     *   Undepended   0011       0011
-     *   Extensible   0010       0010
-     *   Inline       0100       isFlat && !isExtensible && (u1.chars == inlineStorage) || isInt32)
-     *   Stable       0100       isFlat && !isExtensible && (u1.chars != inlineStorage)
-     *   Short        0100       header in FINALIZE_SHORT_STRING arena
-     *   External     0100       header in FINALIZE_EXTERNAL_STRING arena
-     *   Int32        0110       x110 (NYI, Bug 654190)
-     *   Atom         1000       1xxx
-     *   InlineAtom   1000       1000 && is Inline
-     *   ShortAtom    1000       1000 && is Short
-     *   Int32Atom    1110       1110 (NYI, Bug 654190)
+     *   Rope          0000       0000
+     *   Linear        -         !0000
+     *   HasBase       -          xxx1
+     *   Dependent     0001       0001
+     *   Flat          -          isLinear && !isDependent
+     *   Undepended    0011       0011
+     *   Extensible    0010       0010
+     *   Inline        0100       isFlat && !isExtensible && (u1.chars == inlineStorage)
+     *   FatInline     0100       isInline && header in FINALIZE_FAT_INLINE_STRING arena
+     *   External      0100       header in FINALIZE_EXTERNAL_STRING arena
+     *   Atom          -          1xxx
+     *   PermanentAtom 1100       1100
+     *   InlineAtom    -          isAtom && isInline
+     *   FatInlineAtom -          isAtom && isFatInline
      *
      *  "HasBase" here refers to the two string types that have a 'base' field:
      *  JSDependentString and JSUndependedString.
@@ -218,7 +214,10 @@ class JSString : public js::gc::BarrieredCell<JSString>
     static const size_t INT32_FLAGS           = JS_BIT(1) | JS_BIT(2);
 
     static const size_t HAS_BASE_BIT          = JS_BIT(0);
+    static const size_t PERMANENT_BIT         = JS_BIT(2);
     static const size_t ATOM_BIT              = JS_BIT(3);
+
+    static const size_t PERMANENT_ATOM_FLAGS  = JS_BIT(2) | JS_BIT(3);
 
     static const size_t MAX_LENGTH            = JS_BIT(32 - LENGTH_SHIFT) - 1;
 
@@ -251,12 +250,12 @@ class JSString : public js::gc::BarrieredCell<JSString>
   public:
     /* All strings have length. */
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     size_t length() const {
         return d.lengthAndFlags >> LENGTH_SHIFT;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool empty() const {
         return d.lengthAndFlags <= FLAGS_MASK;
     }
@@ -291,7 +290,6 @@ class JSString : public js::gc::BarrieredCell<JSString>
 
     inline JSLinearString *ensureLinear(js::ExclusiveContext *cx);
     inline JSFlatString *ensureFlat(js::ExclusiveContext *cx);
-    inline JSStableString *ensureStable(js::ExclusiveContext *cx);
 
     static bool ensureLinear(js::ExclusiveContext *cx, JSString *str) {
         return str->ensureLinear(cx) != nullptr;
@@ -299,100 +297,99 @@ class JSString : public js::gc::BarrieredCell<JSString>
 
     /* Type query and debug-checked casts */
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isRope() const {
         return (d.lengthAndFlags & FLAGS_MASK) == ROPE_FLAGS;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     JSRope &asRope() const {
         JS_ASSERT(isRope());
         return *(JSRope *)this;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isLinear() const {
         return !isRope();
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     JSLinearString &asLinear() const {
         JS_ASSERT(JSString::isLinear());
         return *(JSLinearString *)this;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isDependent() const {
         return (d.lengthAndFlags & FLAGS_MASK) == DEPENDENT_FLAGS;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     JSDependentString &asDependent() const {
         JS_ASSERT(isDependent());
         return *(JSDependentString *)this;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isFlat() const {
         return isLinear() && !isDependent();
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     JSFlatString &asFlat() const {
         JS_ASSERT(isFlat());
         return *(JSFlatString *)this;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isExtensible() const {
         return (d.lengthAndFlags & FLAGS_MASK) == EXTENSIBLE_FLAGS;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     JSExtensibleString &asExtensible() const {
         JS_ASSERT(isExtensible());
         return *(JSExtensibleString *)this;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isInline() const {
         return isFlat() && !isExtensible() && (d.u1.chars == d.inlineStorage);
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     JSInlineString &asInline() const {
         JS_ASSERT(isInline());
         return *(JSInlineString *)this;
     }
 
-    bool isShort() const;
-
-    JS_ALWAYS_INLINE
-    JSStableString &asStable() const {
-        JS_ASSERT(!isInline());
-        return *(JSStableString *)this;
-    }
+    bool isFatInline() const;
 
     /* For hot code, prefer other type queries. */
     bool isExternal() const;
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     JSExternalString &asExternal() const {
         JS_ASSERT(isExternal());
         return *(JSExternalString *)this;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isUndepended() const {
         return (d.lengthAndFlags & FLAGS_MASK) == UNDEPENDED_FLAGS;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     bool isAtom() const {
-        return (d.lengthAndFlags & ATOM_BIT);
+        return d.lengthAndFlags & ATOM_BIT;
     }
 
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
+    bool isPermanentAtom() const {
+        return (d.lengthAndFlags & FLAGS_MASK) == PERMANENT_ATOM_FLAGS;
+    }
+
+    MOZ_ALWAYS_INLINE
     JSAtom &asAtom() const {
         JS_ASSERT(isAtom());
         return *(JSAtom *)this;
@@ -402,7 +399,7 @@ class JSString : public js::gc::BarrieredCell<JSString>
 
     inline bool hasBase() const {
         JS_STATIC_ASSERT((DEPENDENT_FLAGS | JS_BIT(1)) == UNDEPENDED_FLAGS);
-        return (d.lengthAndFlags & HAS_BASE_BIT);
+        return d.lengthAndFlags & HAS_BASE_BIT;
     }
 
     inline JSLinearString *base() const;
@@ -436,6 +433,24 @@ class JSString : public js::gc::BarrieredCell<JSString>
     static void dumpChars(const jschar *s, size_t len);
     bool equals(const char *s);
 #endif
+
+    static MOZ_ALWAYS_INLINE void readBarrier(JSString *thing) {
+#ifdef JSGC_INCREMENTAL
+        if (thing->isPermanentAtom())
+            return;
+
+        js::gc::BarrieredCell<JSString>::readBarrier(thing);
+#endif
+    }
+
+    static MOZ_ALWAYS_INLINE void writeBarrierPre(JSString *thing) {
+#ifdef JSGC_INCREMENTAL
+        if (isNullLike(thing) || thing->isPermanentAtom())
+            return;
+
+        js::gc::BarrieredCell<JSString>::writeBarrierPre(thing);
+#endif
+    }
 
   private:
     JSString() MOZ_DELETE;
@@ -499,7 +514,7 @@ class JSLinearString : public JSString
     JSLinearString &asLinear() const MOZ_DELETE;
 
   public:
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     const jschar *chars() const {
         JS_ASSERT(JSString::isLinear());
         return d.u1.chars;
@@ -543,8 +558,14 @@ class JSFlatString : public JSLinearString
 
     bool isIndexSlow(uint32_t *indexp) const;
 
+    void init(const jschar *chars, size_t length);
+
   public:
-    JS_ALWAYS_INLINE
+    template <js::AllowGC allowGC>
+    static inline JSFlatString *new_(js::ThreadSafeContext *cx,
+                                     const jschar *chars, size_t length);
+
+    MOZ_ALWAYS_INLINE
     const jschar *charsZ() const {
         JS_ASSERT(JSString::isFlat());
         return chars();
@@ -572,8 +593,12 @@ class JSFlatString : public JSLinearString
      * Once a JSFlatString sub-class has been added to the atom state, this
      * operation changes the string to the JSAtom type, in place.
      */
-    JS_ALWAYS_INLINE JSAtom *morphAtomizedStringIntoAtom() {
+    MOZ_ALWAYS_INLINE JSAtom *morphAtomizedStringIntoAtom() {
         d.lengthAndFlags = buildLengthAndFlags(length(), ATOM_BIT);
+        return &asAtom();
+    }
+    MOZ_ALWAYS_INLINE JSAtom *morphAtomizedStringIntoPermanentAtom() {
+        d.lengthAndFlags = buildLengthAndFlags(length(), PERMANENT_ATOM_FLAGS);
         return &asAtom();
     }
 
@@ -582,88 +607,6 @@ class JSFlatString : public JSLinearString
 
 JS_STATIC_ASSERT(sizeof(JSFlatString) == sizeof(JSString));
 
-class JSStableString : public JSFlatString
-{
-    void init(const jschar *chars, size_t length);
-
-  public:
-    template <js::AllowGC allowGC>
-    static inline JSStableString *new_(js::ThreadSafeContext *cx,
-                                       const jschar *chars, size_t length);
-
-    JS_ALWAYS_INLINE
-    JS::StableCharPtr chars() const {
-        JS_ASSERT(!JSString::isInline());
-        return JS::StableCharPtr(d.u1.chars, length());
-    }
-
-    JS_ALWAYS_INLINE
-    JS::StableTwoByteChars range() const {
-        JS_ASSERT(!JSString::isInline());
-        return JS::StableTwoByteChars(d.u1.chars, length());
-    }
-};
-
-JS_STATIC_ASSERT(sizeof(JSStableString) == sizeof(JSString));
-
-#if !(defined(JSGC_ROOT_ANALYSIS) || defined(JSGC_USE_EXACT_ROOTING))
-namespace JS {
-/*
- * Specialization of Rooted<T> to explicitly root the string rather than
- * relying on conservative stack scanning.
- *
- * In exact-gc builds, Rooted<T> already keeps the T reachable, so this hack is
- * ifdef'd out. In non-exact-gc builds, conservative scanning would ordinarily
- * pick up the slack. However in the case where the Rooted pointer is no longer
- * used, but some subobject or malloc'd memory with the same lifetime may be
- * used, conservative scanning can fail. JSStableString's chars() method makes
- * it particularly attractive to use that way, so we explicitly keep the
- * JSString gc-reachable for the full lifetime of the Rooted<JSStableString *>.
- *
- * It would suffice simply to force the pointer to remain on the stack, a la
- * JS::Anchor<T>, but for some reason using that voodoo here seems to cause
- * some compilers (clang, VC++ with PGO) to generate incorrect code.
- */
-template <>
-class Rooted<JSStableString *>
-{
-  public:
-    Rooted(JSContext *cx, JSStableString *initial = nullptr
-           MOZ_GUARD_OBJECT_NOTIFIER_PARAM)
-      : rooter(cx, initial)
-    {
-        MOZ_GUARD_OBJECT_NOTIFIER_INIT;
-    }
-
-    operator JSStableString *() const { return get(); }
-    JSStableString * operator ->() const { return get(); }
-    JSStableString ** address() { return reinterpret_cast<JSStableString **>(rooter.addr()); }
-    JSStableString * const * address() const {
-        return reinterpret_cast<JSStableString * const *>(rooter.addr());
-    }
-    JSStableString * get() const { return static_cast<JSStableString *>(rooter.string()); }
-
-    Rooted & operator =(JSStableString *value)
-    {
-        JS_ASSERT(!js::GCMethods<JSStableString *>::poisoned(value));
-        rooter.setString(value);
-        return *this;
-    }
-
-    Rooted & operator =(const Rooted &value)
-    {
-        rooter.setString(value.get());
-        return *this;
-    }
-
-  private:
-    JS::AutoStringRooter rooter;
-    MOZ_DECL_USE_GUARD_OBJECT_NOTIFIER
-    Rooted(const Rooted &) MOZ_DELETE;
-};
-}
-#endif
-
 class JSExtensibleString : public JSFlatString
 {
     /* Vacuous and therefore unimplemented. */
@@ -671,7 +614,7 @@ class JSExtensibleString : public JSFlatString
     JSExtensibleString &asExtensible() const MOZ_DELETE;
 
   public:
-    JS_ALWAYS_INLINE
+    MOZ_ALWAYS_INLINE
     size_t capacity() const {
         JS_ASSERT(JSString::isExtensible());
         return d.s.u2.capacity;
@@ -680,6 +623,7 @@ class JSExtensibleString : public JSFlatString
 
 JS_STATIC_ASSERT(sizeof(JSExtensibleString) == sizeof(JSString));
 
+/* On 32-bit platforms, MAX_INLINE_LENGTH is 4. On 64-bit platforms it is 8. */
 class JSInlineString : public JSFlatString
 {
     static const size_t MAX_INLINE_LENGTH = NUM_INLINE_CHARS - 1;
@@ -689,8 +633,6 @@ class JSInlineString : public JSFlatString
     static inline JSInlineString *new_(js::ThreadSafeContext *cx);
 
     inline jschar *init(size_t length);
-
-    JSStableString *uninline(js::ExclusiveContext *cx);
 
     inline void resetLength(size_t length);
 
@@ -705,16 +647,26 @@ class JSInlineString : public JSFlatString
 
 JS_STATIC_ASSERT(sizeof(JSInlineString) == sizeof(JSString));
 
-class JSShortString : public JSInlineString
+/*
+ * On both 32-bit and 64-bit platforms, INLINE_EXTENSION_CHARS is 12. This is
+ * deliberate, in order to minimize potential performance differences between
+ * 32-bit and 64-bit platforms.
+ *
+ * There are still some differences due to NUM_INLINE_CHARS being different.
+ * E.g. strings of length 4--7 will be JSFatInlineStrings on 32-bit platforms
+ * and JSInlineStrings on 64-bit platforms. But the more significant transition
+ * from inline strings to non-inline strings occurs at length 12 on both 32-bit
+ * and 64-bit platforms.
+ */
+class JSFatInlineString : public JSInlineString
 {
-    /* This can be any value that is a multiple of CellSize. */
-    static const size_t INLINE_EXTENSION_CHARS = sizeof(JSString::Data) / sizeof(jschar);
+    static const size_t INLINE_EXTENSION_CHARS = 12 - NUM_INLINE_CHARS;
 
     static void staticAsserts() {
-        JS_STATIC_ASSERT(INLINE_EXTENSION_CHARS % js::gc::CellSize == 0);
-        JS_STATIC_ASSERT(MAX_SHORT_LENGTH + 1 ==
-                         (sizeof(JSShortString) -
-                          offsetof(JSShortString, d.inlineStorage)) / sizeof(jschar));
+        JS_STATIC_ASSERT((INLINE_EXTENSION_CHARS * sizeof(jschar)) % js::gc::CellSize == 0);
+        JS_STATIC_ASSERT(MAX_FAT_INLINE_LENGTH + 1 ==
+                         (sizeof(JSFatInlineString) -
+                          offsetof(JSFatInlineString, d.inlineStorage)) / sizeof(jschar));
     }
 
   protected: /* to fool clang into not warning this is unused */
@@ -722,22 +674,22 @@ class JSShortString : public JSInlineString
 
   public:
     template <js::AllowGC allowGC>
-    static inline JSShortString *new_(js::ThreadSafeContext *cx);
+    static inline JSFatInlineString *new_(js::ThreadSafeContext *cx);
 
-    static const size_t MAX_SHORT_LENGTH = JSString::NUM_INLINE_CHARS +
-                                           INLINE_EXTENSION_CHARS
-                                           -1 /* null terminator */;
+    static const size_t MAX_FAT_INLINE_LENGTH = JSString::NUM_INLINE_CHARS +
+                                                INLINE_EXTENSION_CHARS
+                                                -1 /* null terminator */;
 
     static bool lengthFits(size_t length) {
-        return length <= MAX_SHORT_LENGTH;
+        return length <= MAX_FAT_INLINE_LENGTH;
     }
 
-    /* Only called by the GC for strings with the FINALIZE_SHORT_STRING kind. */
+    /* Only called by the GC for strings with the FINALIZE_FAT_INLINE_STRING kind. */
 
-    JS_ALWAYS_INLINE void finalize(js::FreeOp *fop);
+    MOZ_ALWAYS_INLINE void finalize(js::FreeOp *fop);
 };
 
-JS_STATIC_ASSERT(sizeof(JSShortString) == 2 * sizeof(JSString));
+JS_STATIC_ASSERT(sizeof(JSFatInlineString) % js::gc::CellSize == 0);
 
 class JSExternalString : public JSFlatString
 {
@@ -785,6 +737,17 @@ class JSAtom : public JSFlatString
     inline js::PropertyName *asPropertyName();
 
     inline void finalize(js::FreeOp *fop);
+
+    MOZ_ALWAYS_INLINE
+    bool isPermanent() const {
+        return d.lengthAndFlags & PERMANENT_BIT;
+    }
+
+    // Transform this atom into a permanent atom. This is only done during
+    // initialization of the runtime.
+    MOZ_ALWAYS_INLINE void morphIntoPermanentAtom() {
+        d.lengthAndFlags = buildLengthAndFlags(length(), PERMANENT_ATOM_FLAGS);
+    }
 
 #ifdef DEBUG
     void dump();
@@ -841,12 +804,6 @@ class StaticStrings
 
     JSAtom *length2StaticTable[NUM_SMALL_CHARS * NUM_SMALL_CHARS];
 
-    void clear() {
-        mozilla::PodArrayZero(unitStaticTable);
-        mozilla::PodArrayZero(length2StaticTable);
-        mozilla::PodArrayZero(intStaticTable);
-    }
-
   public:
     /* We keep these public for the JITs. */
     static const size_t UNIT_STATIC_LIMIT   = 256U;
@@ -856,14 +813,11 @@ class StaticStrings
     JSAtom *intStaticTable[INT_STATIC_LIMIT];
 
     StaticStrings() {
-        clear();
+        mozilla::PodZero(this);
     }
 
     bool init(JSContext *cx);
     void trace(JSTracer *trc);
-    void finish() {
-        clear();
-    }
 
     static bool hasUint(uint32_t u) { return u < INT_STATIC_LIMIT; }
 
@@ -965,7 +919,7 @@ class PropertyName : public JSAtom
 
 JS_STATIC_ASSERT(sizeof(PropertyName) == sizeof(JSString));
 
-static JS_ALWAYS_INLINE jsid
+static MOZ_ALWAYS_INLINE jsid
 NameToId(PropertyName *name)
 {
     return NON_INTEGER_ATOM_TO_JSID(name);
@@ -985,7 +939,7 @@ class AutoNameVector : public AutoVectorRooter<PropertyName *>
     }
 
     HandlePropertyName operator[](size_t i) const {
-        return HandlePropertyName::fromMarkedLocation(&BaseType::operator[](i));
+        return HandlePropertyName::fromMarkedLocation(&begin()[i]);
     }
 
     MOZ_DECL_USE_GUARD_OBJECT_NOTIFIER
@@ -995,7 +949,7 @@ class AutoNameVector : public AutoVectorRooter<PropertyName *>
 
 /* Avoid requiring vm/String-inl.h just to call getChars. */
 
-JS_ALWAYS_INLINE const jschar *
+MOZ_ALWAYS_INLINE const jschar *
 JSString::getChars(js::ExclusiveContext *cx)
 {
     if (JSLinearString *str = ensureLinear(cx))
@@ -1003,7 +957,7 @@ JSString::getChars(js::ExclusiveContext *cx)
     return nullptr;
 }
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 JSString::getChar(js::ExclusiveContext *cx, size_t index, jschar *code)
 {
     JS_ASSERT(index < length());
@@ -1037,7 +991,7 @@ JSString::getChar(js::ExclusiveContext *cx, size_t index, jschar *code)
     return true;
 }
 
-JS_ALWAYS_INLINE const jschar *
+MOZ_ALWAYS_INLINE const jschar *
 JSString::getCharsZ(js::ExclusiveContext *cx)
 {
     if (JSFlatString *str = ensureFlat(cx))
@@ -1045,28 +999,28 @@ JSString::getCharsZ(js::ExclusiveContext *cx)
     return nullptr;
 }
 
-JS_ALWAYS_INLINE const jschar *
+MOZ_ALWAYS_INLINE const jschar *
 JSString::pureChars() const
 {
     JS_ASSERT(hasPureChars());
     return asLinear().chars();
 }
 
-JS_ALWAYS_INLINE const jschar *
+MOZ_ALWAYS_INLINE const jschar *
 JSString::pureCharsZ() const
 {
     JS_ASSERT(hasPureCharsZ());
     return asFlat().charsZ();
 }
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 JSString::copyNonPureChars(js::ThreadSafeContext *cx, js::ScopedJSFreePtr<jschar> &out) const
 {
     JS_ASSERT(!hasPureChars());
     return asRope().copyNonPureChars(cx, out);
 }
 
-JS_ALWAYS_INLINE bool
+MOZ_ALWAYS_INLINE bool
 JSString::copyNonPureCharsZ(js::ThreadSafeContext *cx, js::ScopedJSFreePtr<jschar> &out) const
 {
     JS_ASSERT(!hasPureChars());
@@ -1075,7 +1029,7 @@ JSString::copyNonPureCharsZ(js::ThreadSafeContext *cx, js::ScopedJSFreePtr<jscha
     return asRope().copyNonPureCharsZ(cx, out);
 }
 
-JS_ALWAYS_INLINE JSLinearString *
+MOZ_ALWAYS_INLINE JSLinearString *
 JSString::ensureLinear(js::ExclusiveContext *cx)
 {
     return isLinear()
@@ -1083,7 +1037,7 @@ JSString::ensureLinear(js::ExclusiveContext *cx)
            : asRope().flatten(cx);
 }
 
-JS_ALWAYS_INLINE JSFlatString *
+MOZ_ALWAYS_INLINE JSFlatString *
 JSString::ensureFlat(js::ExclusiveContext *cx)
 {
     return isFlat()
@@ -1091,31 +1045,6 @@ JSString::ensureFlat(js::ExclusiveContext *cx)
            : isDependent()
              ? asDependent().undepend(cx)
              : asRope().flatten(cx);
-}
-
-JS_ALWAYS_INLINE JSStableString *
-JSString::ensureStable(js::ExclusiveContext *maybecx)
-{
-    if (isRope()) {
-        JSFlatString *flat = asRope().flatten(maybecx);
-        if (!flat)
-            return nullptr;
-        JS_ASSERT(!flat->isInline());
-        return &flat->asStable();
-    }
-
-    if (isDependent()) {
-        JSFlatString *flat = asDependent().undepend(maybecx);
-        if (!flat)
-            return nullptr;
-        return &flat->asStable();
-    }
-
-    if (!isInline())
-        return &asStable();
-
-    JS_ASSERT(isInline());
-    return asInline().uninline(maybecx);
 }
 
 inline JSLinearString *

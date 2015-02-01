@@ -35,9 +35,10 @@
 using namespace js;
 
 using mozilla::Abs;
-using mozilla::DoubleEqualsInt32;
-using mozilla::DoubleIsInt32;
+using mozilla::NumberEqualsInt32;
+using mozilla::NumberIsInt32;
 using mozilla::ExponentComponent;
+using mozilla::FloatingPoint;
 using mozilla::IsFinite;
 using mozilla::IsInfinite;
 using mozilla::IsNaN;
@@ -45,31 +46,8 @@ using mozilla::IsNegative;
 using mozilla::IsNegativeZero;
 using mozilla::PositiveInfinity;
 using mozilla::NegativeInfinity;
-using mozilla::SpecificNaN;
 using JS::ToNumber;
 using JS::GenericNaN;
-
-#ifndef M_E
-#define M_E             2.7182818284590452354
-#endif
-#ifndef M_LOG2E
-#define M_LOG2E         1.4426950408889634074
-#endif
-#ifndef M_LOG10E
-#define M_LOG10E        0.43429448190325182765
-#endif
-#ifndef M_LN2
-#define M_LN2           0.69314718055994530942
-#endif
-#ifndef M_LN10
-#define M_LN10          2.30258509299404568402
-#endif
-#ifndef M_SQRT2
-#define M_SQRT2         1.41421356237309504880
-#endif
-#ifndef M_SQRT1_2
-#define M_SQRT1_2       0.70710678118654752440
-#endif
 
 static const JSConstDoubleSpec math_constants[] = {
     {M_E,       "E",            0, {0,0,0}},
@@ -331,6 +309,29 @@ js::math_ceil(JSContext *cx, unsigned argc, Value *vp)
     return true;
 }
 
+bool
+js::math_clz32(JSContext *cx, unsigned argc, Value *vp)
+{
+    CallArgs args = CallArgsFromVp(argc, vp);
+
+    if (args.length() == 0) {
+        args.rval().setInt32(32);
+        return true;
+    }
+
+    uint32_t n;
+    if (!ToUint32(cx, args[0], &n))
+        return false;
+
+    if (n == 0) {
+        args.rval().setInt32(32);
+        return true;
+    }
+
+    args.rval().setInt32(mozilla::CountLeadingZeroes32(n));
+    return true;
+}
+
 double
 js::math_cos_impl(MathCache *cache, double x)
 {
@@ -369,9 +370,9 @@ js::math_cos(JSContext *cx, unsigned argc, Value *vp)
 #ifdef _WIN32
 #define EXP_IF_OUT_OF_RANGE(x)                  \
     if (!IsNaN(x)) {                            \
-        if (x == PositiveInfinity())            \
-            return PositiveInfinity();          \
-        if (x == NegativeInfinity())            \
+        if (x == PositiveInfinity<double>())    \
+            return PositiveInfinity<double>();  \
+        if (x == NegativeInfinity<double>())    \
             return 0.0;                         \
     }
 #else
@@ -460,6 +461,16 @@ js::math_imul(JSContext *cx, unsigned argc, Value *vp)
     return true;
 }
 
+// Implements Math.fround (20.2.2.16) up to step 3
+bool
+js::RoundFloat32(JSContext *cx, Handle<Value> v, float *out)
+{
+    double d;
+    bool success = ToNumber(cx, v, &d);
+    *out = static_cast<float>(d);
+    return success;
+}
+
 bool
 js::math_fround(JSContext *cx, unsigned argc, Value *vp)
 {
@@ -470,11 +481,10 @@ js::math_fround(JSContext *cx, unsigned argc, Value *vp)
         return true;
     }
 
-    double x;
-    if (!ToNumber(cx, args[0], &x))
+    float f;
+    if (!RoundFloat32(cx, args[0], &f))
         return false;
 
-    float f = x;
     args.rval().setDouble(static_cast<double>(f));
     return true;
 }
@@ -529,7 +539,7 @@ js_math_max(JSContext *cx, unsigned argc, Value *vp)
 {
     CallArgs args = CallArgsFromVp(argc, vp);
 
-    double maxval = NegativeInfinity();
+    double maxval = NegativeInfinity<double>();
     for (unsigned i = 0; i < args.length(); i++) {
         double x;
         if (!ToNumber(cx, args[i], &x))
@@ -547,7 +557,7 @@ js_math_min(JSContext *cx, unsigned argc, Value *vp)
 {
     CallArgs args = CallArgsFromVp(argc, vp);
 
-    double minval = PositiveInfinity();
+    double minval = PositiveInfinity<double>();
     for (unsigned i = 0; i < args.length(); i++) {
         double x;
         if (!ToNumber(cx, args[i], &x))
@@ -607,7 +617,7 @@ js::ecmaPow(double x, double y)
      * check for NaN since a comparison with NaN is always false.
      */
     int32_t yi;
-    if (DoubleEqualsInt32(y, &yi))
+    if (NumberEqualsInt32(y, &yi))
         return powi(x, yi);
 
     /*
@@ -616,9 +626,21 @@ js::ecmaPow(double x, double y)
      */
     if (!IsFinite(y) && (x == 1.0 || x == -1.0))
         return GenericNaN();
+
     /* pow(x, +-0) is always 1, even for x = NaN (MSVC gets this wrong). */
     if (y == 0)
         return 1;
+
+    /*
+     * Special case for square roots. Note that pow(x, 0.5) != sqrt(x)
+     * when x = -0.0, so we have to guard for this.
+     */
+    if (IsFinite(x) && x != 0.0) {
+        if (y == 0.5)
+            return sqrt(x);
+        if (y == -0.5)
+            return 1.0 / sqrt(x);
+    }
     return pow(x, y);
 }
 #if defined(_MSC_VER)
@@ -642,29 +664,7 @@ js_math_pow(JSContext *cx, unsigned argc, Value *vp)
     if (!ToNumber(cx, args.get(1), &y))
         return false;
 
-    /*
-     * Special case for square roots. Note that pow(x, 0.5) != sqrt(x)
-     * when x = -0.0, so we have to guard for this.
-     */
-    if (IsFinite(x) && x != 0.0) {
-        if (y == 0.5) {
-            args.rval().setNumber(sqrt(x));
-            return true;
-        }
-        if (y == -0.5) {
-            args.rval().setNumber(1.0/sqrt(x));
-            return true;
-        }
-    }
-
-    /* pow(x, +-0) is always 1, even for x = NaN. */
-    if (y == 0) {
-        args.rval().setInt32(1);
-        return true;
-    }
-
     double z = ecmaPow(x, y);
-
     args.rval().setNumber(z);
     return true;
 }
@@ -768,15 +768,29 @@ js_math_random(JSContext *cx, unsigned argc, Value *vp)
 double
 js::math_round_impl(double x)
 {
-    int32_t i;
-    if (DoubleIsInt32(x, &i))
-        return double(i);
+    int32_t ignored;
+    if (NumberIsInt32(x, &ignored))
+        return x;
 
     /* Some numbers are so big that adding 0.5 would give the wrong number. */
-    if (ExponentComponent(x) >= 52)
+    if (ExponentComponent(x) >= int_fast16_t(FloatingPoint<double>::ExponentShift))
         return x;
 
     return js_copysign(floor(x + 0.5), x);
+}
+
+float
+js::math_roundf_impl(float x)
+{
+    int32_t ignored;
+    if (NumberIsInt32(x, &ignored))
+        return x;
+
+    /* Some numbers are so big that adding 0.5 would give the wrong number. */
+    if (ExponentComponent(x) >= int_fast16_t(FloatingPoint<float>::ExponentShift))
+        return x;
+
+    return js_copysign(floorf(x + 0.5f), x);
 }
 
 bool /* ES5 15.8.2.15. */
@@ -1278,7 +1292,7 @@ js::ecmaHypot(double x, double y)
      * is NaN, not Infinity.
      */
     if (mozilla::IsInfinite(x) || mozilla::IsInfinite(y)) {
-        return mozilla::PositiveInfinity();
+        return mozilla::PositiveInfinity<double>();
     }
 #endif
     return hypot(x, y);
@@ -1327,7 +1341,7 @@ js::math_hypot(JSContext *cx, unsigned argc, Value *vp)
         }
     }
 
-    double result = isInfinite ? PositiveInfinity() :
+    double result = isInfinite ? PositiveInfinity<double>() :
                     isNaN ? GenericNaN() :
                     scale * sqrt(sumsq);
     args.rval().setNumber(result);
@@ -1436,6 +1450,7 @@ static const JSFunctionSpec math_static_methods[] = {
     JS_FN("atan",           math_atan,            1, 0),
     JS_FN("atan2",          math_atan2,           2, 0),
     JS_FN("ceil",           math_ceil,            1, 0),
+    JS_FN("clz32",          math_clz32,           1, 0),
     JS_FN("cos",            math_cos,             1, 0),
     JS_FN("exp",            math_exp,             1, 0),
     JS_FN("floor",          math_floor,           1, 0),
@@ -1477,8 +1492,9 @@ js_InitMathClass(JSContext *cx, HandleObject obj)
     if (!Math)
         return nullptr;
 
-    if (!JS_DefineProperty(cx, obj, js_Math_str, OBJECT_TO_JSVAL(Math),
-                           JS_PropertyStub, JS_StrictPropertyStub, 0)) {
+    if (!JS_DefineProperty(cx, obj, js_Math_str, Math, 0,
+                           JS_PropertyStub, JS_StrictPropertyStub))
+    {
         return nullptr;
     }
 

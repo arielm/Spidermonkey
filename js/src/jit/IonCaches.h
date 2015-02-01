@@ -7,8 +7,10 @@
 #ifndef jit_IonCaches_h
 #define jit_IonCaches_h
 
-#ifdef JS_CPU_ARM
+#if defined(JS_CODEGEN_ARM)
 # include "jit/arm/Assembler-arm.h"
+#elif defined(JS_CODEGEN_MIPS)
+# include "jit/mips/Assembler-mips.h"
 #endif
 #include "jit/Registers.h"
 #include "jit/shared/Assembler-shared.h"
@@ -201,7 +203,7 @@ class IonCache
 
     virtual void emitInitialJump(MacroAssembler &masm, AddCacheState &addState) = 0;
     virtual void bindInitialJump(MacroAssembler &masm, AddCacheState &addState) = 0;
-    virtual void updateBaseAddress(IonCode *code, MacroAssembler &masm);
+    virtual void updateBaseAddress(JitCode *code, MacroAssembler &masm);
 
     // Initialize the AddCacheState depending on the kind of cache, like
     // setting a scratch register. Defaults to doing nothing.
@@ -230,10 +232,10 @@ class IonCache
     // monitoring/allocation caused an invalidation of the running ion script,
     // this function returns CACHE_FLUSHED. In case of allocation issue this
     // function returns LINK_ERROR.
-    LinkStatus linkCode(JSContext *cx, MacroAssembler &masm, IonScript *ion, IonCode **code);
+    LinkStatus linkCode(JSContext *cx, MacroAssembler &masm, IonScript *ion, JitCode **code);
     // Fixup variables and update jumps in the list of stubs.  Increment the
     // number of attached stubs accordingly.
-    void attachStub(MacroAssembler &masm, StubAttacher &attacher, Handle<IonCode *> code);
+    void attachStub(MacroAssembler &masm, StubAttacher &attacher, Handle<JitCode *> code);
 
     // Combine both linkStub and attachStub into one function. In addition, it
     // produces a spew augmented with the attachKind string.
@@ -347,15 +349,18 @@ class RepatchIonCache : public IonCache
     CodeLocationJump lastJump_;
 
     // Offset from the initial jump to the rejoin label.
-#ifdef JS_CPU_ARM
+#ifdef JS_CODEGEN_ARM
     static const size_t REJOIN_LABEL_OFFSET = 4;
+#elif defined(JS_CODEGEN_MIPS)
+    // The size of jump created by MacroAssemblerMIPSCompat::jumpWithPatch.
+    static const size_t REJOIN_LABEL_OFFSET = 4 * sizeof(void *);
 #else
     static const size_t REJOIN_LABEL_OFFSET = 0;
 #endif
 
     CodeLocationLabel rejoinLabel() const {
         uint8_t *ptr = initialJump_.raw();
-#ifdef JS_CPU_ARM
+#if defined(JS_CODEGEN_ARM) || defined(JS_CODEGEN_MIPS)
         uint32_t i = 0;
         while (i < REJOIN_LABEL_OFFSET)
             ptr = Assembler::nextInstruction(ptr, &i);
@@ -380,7 +385,7 @@ class RepatchIonCache : public IonCache
     void bindInitialJump(MacroAssembler &masm, AddCacheState &addState);
 
     // Update the labels once the code is finalized.
-    void updateBaseAddress(IonCode *code, MacroAssembler &masm);
+    void updateBaseAddress(JitCode *code, MacroAssembler &masm);
 };
 
 //
@@ -478,7 +483,7 @@ class DispatchIonCache : public IonCache
     void bindInitialJump(MacroAssembler &masm, AddCacheState &addState);
 
     // Fix up the first stub pointer once the code is finalized.
-    void updateBaseAddress(IonCode *code, MacroAssembler &masm);
+    void updateBaseAddress(JitCode *code, MacroAssembler &masm);
 };
 
 // Define the cache kind and pre-declare data structures used for calling inline
@@ -530,7 +535,6 @@ class GetPropertyIC : public RepatchIonCache
     size_t locationsIndex_;
     size_t numLocations_;
 
-    bool allowGetters_ : 1;
     bool monitoredResult_ : 1;
     bool hasTypedArrayLengthStub_ : 1;
     bool hasStrictArgumentsLengthStub_ : 1;
@@ -541,14 +545,13 @@ class GetPropertyIC : public RepatchIonCache
     GetPropertyIC(RegisterSet liveRegs,
                   Register object, PropertyName *name,
                   TypedOrValueRegister output,
-                  bool allowGetters, bool monitoredResult)
+                  bool monitoredResult)
       : liveRegs_(liveRegs),
         object_(object),
         name_(name),
         output_(output),
         locationsIndex_(0),
         numLocations_(0),
-        allowGetters_(allowGetters),
         monitoredResult_(monitoredResult),
         hasTypedArrayLengthStub_(false),
         hasStrictArgumentsLengthStub_(false),
@@ -569,9 +572,6 @@ class GetPropertyIC : public RepatchIonCache
     }
     TypedOrValueRegister output() const {
         return output_;
-    }
-    bool allowGetters() const {
-        return allowGetters_ && !idempotent();
     }
     bool monitoredResult() const {
         return monitoredResult_;
@@ -609,6 +609,9 @@ class GetPropertyIC : public RepatchIonCache
     // Helpers for CanAttachNativeGetProp
     typedef JSContext * Context;
     bool allowArrayLength(Context cx, HandleObject obj) const;
+    bool allowGetters() const {
+        return monitoredResult() && !idempotent();
+    }
 
     // Attach the proper stub, if possible
     bool tryAttachStub(JSContext *cx, IonScript *ion, HandleObject obj,
@@ -1042,7 +1045,7 @@ class GetPropertyParIC : public ParallelIonCache
 
     CACHE_HEADER(GetPropertyPar)
 
-#ifdef JS_CPU_X86
+#ifdef JS_CODEGEN_X86
     // x86 lacks a general purpose scratch register for dispatch caches and
     // must be given one manually.
     void initializeAddCacheState(LInstruction *ins, AddCacheState *addState);
@@ -1074,7 +1077,7 @@ class GetPropertyParIC : public ParallelIonCache
     bool attachArrayLength(LockedJSContext &cx, IonScript *ion, JSObject *obj);
     bool attachTypedArrayLength(LockedJSContext &cx, IonScript *ion, JSObject *obj);
 
-    static bool update(ForkJoinSlice *slice, size_t cacheIndex, HandleObject obj,
+    static bool update(ForkJoinContext *cx, size_t cacheIndex, HandleObject obj,
                        MutableHandleValue vp);
 };
 
@@ -1101,7 +1104,7 @@ class GetElementParIC : public ParallelIonCache
 
     CACHE_HEADER(GetElementPar)
 
-#ifdef JS_CPU_X86
+#ifdef JS_CODEGEN_X86
     // x86 lacks a general purpose scratch register for dispatch caches and
     // must be given one manually.
     void initializeAddCacheState(LInstruction *ins, AddCacheState *addState);
@@ -1135,7 +1138,7 @@ class GetElementParIC : public ParallelIonCache
     bool attachTypedArrayElement(LockedJSContext &cx, IonScript *ion, TypedArrayObject *tarr,
                                  const Value &idval);
 
-    static bool update(ForkJoinSlice *slice, size_t cacheIndex, HandleObject obj, HandleValue idval,
+    static bool update(ForkJoinContext *cx, size_t cacheIndex, HandleObject obj, HandleValue idval,
                        MutableHandleValue vp);
 
 };
@@ -1162,7 +1165,7 @@ class SetPropertyParIC : public ParallelIonCache
 
     CACHE_HEADER(SetPropertyPar)
 
-#ifdef JS_CPU_X86
+#ifdef JS_CODEGEN_X86
     // x86 lacks a general purpose scratch register for dispatch caches and
     // must be given one manually.
     void initializeAddCacheState(LInstruction *ins, AddCacheState *addState);
@@ -1189,7 +1192,7 @@ class SetPropertyParIC : public ParallelIonCache
     bool attachAddSlot(LockedJSContext &cx, IonScript *ion, JSObject *obj, Shape *oldShape,
                        bool checkTypeset);
 
-    static bool update(ForkJoinSlice *slice, size_t cacheIndex, HandleObject obj,
+    static bool update(ForkJoinContext *cx, size_t cacheIndex, HandleObject obj,
                        HandleValue value);
 };
 
@@ -1222,7 +1225,7 @@ class SetElementParIC : public ParallelIonCache
 
     CACHE_HEADER(SetElementPar)
 
-#ifdef JS_CPU_X86
+#ifdef JS_CODEGEN_X86
     // x86 lacks a general purpose scratch register for dispatch caches and
     // must be given one manually.
     void initializeAddCacheState(LInstruction *ins, AddCacheState *addState);
@@ -1256,7 +1259,7 @@ class SetElementParIC : public ParallelIonCache
     bool attachDenseElement(LockedJSContext &cx, IonScript *ion, JSObject *obj, const Value &idval);
     bool attachTypedArrayElement(LockedJSContext &cx, IonScript *ion, TypedArrayObject *tarr);
 
-    static bool update(ForkJoinSlice *slice, size_t cacheIndex, HandleObject obj,
+    static bool update(ForkJoinContext *cx, size_t cacheIndex, HandleObject obj,
                        HandleValue idval, HandleValue value);
 };
 

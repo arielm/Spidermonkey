@@ -55,6 +55,13 @@ static MOZ_CONSTEXPR_VAR Register CallTempReg3 = ecx;
 static MOZ_CONSTEXPR_VAR Register CallTempReg4 = esi;
 static MOZ_CONSTEXPR_VAR Register CallTempReg5 = edx;
 
+// The convention used by the ForkJoinGetSlice stub. None of these can be eax
+// or edx, which the stub also needs for cmpxchg and div, respectively.
+static MOZ_CONSTEXPR_VAR Register ForkJoinGetSliceReg_cx = edi;
+static MOZ_CONSTEXPR_VAR Register ForkJoinGetSliceReg_temp0 = ebx;
+static MOZ_CONSTEXPR_VAR Register ForkJoinGetSliceReg_temp1 = ecx;
+static MOZ_CONSTEXPR_VAR Register ForkJoinGetSliceReg_output = esi;
+
 // We have no arg regs, so our NonArgRegs are just our CallTempReg*
 static MOZ_CONSTEXPR_VAR Register CallTempNonArgRegs[] = { edi, eax, ebx, ecx, esi, edx };
 static const uint32_t NumCallTempNonArgRegs =
@@ -79,6 +86,20 @@ class ABIArgGenerator
 
 static MOZ_CONSTEXPR_VAR Register OsrFrameReg = edx;
 static MOZ_CONSTEXPR_VAR Register PreBarrierReg = edx;
+
+// Registers used in the GenerateFFIIonExit Enable Activation block.
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegCallee = ecx;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE0 = edi;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE1 = eax;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE2 = ebx;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE3 = edx;
+
+// Registers used in the GenerateFFIIonExit Disable Activation block.
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegReturnData = edx;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegReturnType = ecx;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegD0 = edi;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegD1 = eax;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegD2 = esi;
 
 // GCC stack is aligned on 16 bytes, but we don't maintain the invariant in
 // jitted code.
@@ -140,7 +161,7 @@ class Assembler : public AssemblerX86Shared
     }
     void addPendingJump(JmpSrc src, ImmPtr target, Relocation::Kind kind) {
         enoughMemory_ &= jumps_.append(RelativePatch(src.offset(), target.value, kind));
-        if (kind == Relocation::IONCODE)
+        if (kind == Relocation::JITCODE)
             writeRelocation(src);
     }
 
@@ -156,7 +177,7 @@ class Assembler : public AssemblerX86Shared
     using AssemblerX86Shared::push;
     using AssemblerX86Shared::pop;
 
-    static void TraceJumpRelocations(JSTracer *trc, IonCode *code, CompactBufferReader &reader);
+    static void TraceJumpRelocations(JSTracer *trc, JitCode *code, CompactBufferReader &reader);
 
     // Copy the assembly code to the given buffer, and perform any pending
     // relocations relying on the target address.
@@ -239,8 +260,7 @@ class Assembler : public AssemblerX86Shared
     }
     void mov(AsmJSImmPtr imm, Register dest) {
         masm.movl_i32r(-1, dest.code());
-        AsmJSAbsoluteLink link(masm.currentOffset(), imm.kind());
-        enoughMemory_ &= asmJSAbsoluteLinks_.append(link);
+        enoughMemory_ &= append(AsmJSAbsoluteLink(masm.currentOffset(), imm.kind()));
     }
     void mov(const Operand &src, const Register &dest) {
         movl(src, dest);
@@ -272,6 +292,16 @@ class Assembler : public AssemblerX86Shared
         switch (dest.kind()) {
           case Operand::MEM_REG_DISP:
             masm.fld32_m(dest.disp(), dest.base());
+            break;
+          default:
+            MOZ_ASSUME_UNREACHABLE("unexpected operand kind");
+        }
+    }
+
+    void fstp32(const Operand &src) {
+        switch (src.kind()) {
+          case Operand::MEM_REG_DISP:
+            masm.fstp32_m(src.disp(), src.base());
             break;
           default:
             MOZ_ASSUME_UNREACHABLE("unexpected operand kind");
@@ -311,8 +341,7 @@ class Assembler : public AssemblerX86Shared
     }
     void cmpl(const AsmJSAbsoluteAddress &lhs, const Register &rhs) {
         masm.cmpl_rm_force32(rhs.code(), (void*)-1);
-        AsmJSAbsoluteLink link(masm.currentOffset(), lhs.kind());
-        enoughMemory_ &= asmJSAbsoluteLinks_.append(link);
+        enoughMemory_ &= append(AsmJSAbsoluteLink(masm.currentOffset(), lhs.kind()));
     }
     CodeOffsetLabel cmplWithPatch(const Register &lhs, Imm32 rhs) {
         masm.cmpl_ir_force32(rhs.value, lhs.code());
@@ -329,15 +358,15 @@ class Assembler : public AssemblerX86Shared
         addPendingJump(src, target, reloc);
     }
 
-    void jmp(IonCode *target) {
-        jmp(ImmPtr(target->raw()), Relocation::IONCODE);
+    void jmp(JitCode *target) {
+        jmp(ImmPtr(target->raw()), Relocation::JITCODE);
     }
-    void j(Condition cond, IonCode *target) {
-        j(cond, ImmPtr(target->raw()), Relocation::IONCODE);
+    void j(Condition cond, JitCode *target) {
+        j(cond, ImmPtr(target->raw()), Relocation::JITCODE);
     }
-    void call(IonCode *target) {
+    void call(JitCode *target) {
         JmpSrc src = masm.call();
-        addPendingJump(src, ImmPtr(target->raw()), Relocation::IONCODE);
+        addPendingJump(src, ImmPtr(target->raw()), Relocation::JITCODE);
     }
     void call(ImmWord target) {
         call(ImmPtr((void*)target.value));
@@ -356,10 +385,10 @@ class Assembler : public AssemblerX86Shared
 
     // Emit a CALL or CMP (nop) instruction. ToggleCall can be used to patch
     // this instruction.
-    CodeOffsetLabel toggledCall(IonCode *target, bool enabled) {
+    CodeOffsetLabel toggledCall(JitCode *target, bool enabled) {
         CodeOffsetLabel offset(size());
         JmpSrc src = enabled ? masm.call() : masm.cmp_eax();
-        addPendingJump(src, ImmPtr(target->raw()), Relocation::IONCODE);
+        addPendingJump(src, ImmPtr(target->raw()), Relocation::JITCODE);
         JS_ASSERT(size() - offset.offset() == ToggledCallSize());
         return offset;
     }

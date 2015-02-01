@@ -73,7 +73,7 @@ obj_propertyIsEnumerable(JSContext *cx, unsigned argc, Value *vp)
     }
 
     if (pobj != obj) {
-        vp->setBoolean(false);
+        args.rval().setBoolean(false);
         return true;
     }
 
@@ -145,7 +145,7 @@ js::ObjectToSource(JSContext *cx, HandleObject obj)
         int valcnt = 0;
         if (shape) {
             bool doGet = true;
-            if (obj2->isNative() && !IsImplicitDenseElement(shape)) {
+            if (obj2->isNative() && !IsImplicitDenseOrTypedArrayElement(shape)) {
                 unsigned attrs = shape->attributes();
                 if (attrs & JSPROP_GETTER) {
                     doGet = false;
@@ -272,7 +272,23 @@ js::ObjectToSource(JSContext *cx, HandleObject obj)
 JSString *
 JS_BasicObjectToString(JSContext *cx, HandleObject obj)
 {
+    // Some classes are really common, don't allocate new strings for them.
+    // The ordering below is based on the measurements in bug 966264.
+    if (obj->is<JSObject>())
+        return cx->names().objectObject;
+    if (obj->is<StringObject>())
+        return cx->names().objectString;
+    if (obj->is<ArrayObject>())
+        return cx->names().objectArray;
+    if (obj->is<JSFunction>())
+        return cx->names().objectFunction;
+    if (obj->is<NumberObject>())
+        return cx->names().objectNumber;
+
     const char *className = JSObject::className(cx, obj);
+
+    if (strcmp(className, "Window") == 0)
+        return cx->names().objectWindow;
 
     StringBuffer sb(cx);
     if (!sb.append("[object ") || !sb.appendInflated(className, strlen(className)) ||
@@ -426,7 +442,7 @@ obj_lookupGetter(JSContext *cx, unsigned argc, Value *vp)
         // native. Handle proxies separately.
         args.rval().setUndefined();
         Rooted<PropertyDescriptor> desc(cx);
-        if (!Proxy::getPropertyDescriptor(cx, obj, id, &desc, 0))
+        if (!Proxy::getPropertyDescriptor(cx, obj, id, &desc))
             return false;
         if (desc.object() && desc.hasGetterObject() && desc.getterObject())
             args.rval().setObject(*desc.getterObject());
@@ -438,7 +454,7 @@ obj_lookupGetter(JSContext *cx, unsigned argc, Value *vp)
         return false;
     args.rval().setUndefined();
     if (shape) {
-        if (pobj->isNative() && !IsImplicitDenseElement(shape)) {
+        if (pobj->isNative() && !IsImplicitDenseOrTypedArrayElement(shape)) {
             if (shape->hasGetterValue())
                 args.rval().set(shape->getterValue());
         }
@@ -462,7 +478,7 @@ obj_lookupSetter(JSContext *cx, unsigned argc, Value *vp)
         // native. Handle proxies separately.
         args.rval().setUndefined();
         Rooted<PropertyDescriptor> desc(cx);
-        if (!Proxy::getPropertyDescriptor(cx, obj, id, &desc, 0))
+        if (!Proxy::getPropertyDescriptor(cx, obj, id, &desc))
             return false;
         if (desc.object() && desc.hasSetterObject() && desc.setterObject())
             args.rval().setObject(*desc.setterObject());
@@ -474,7 +490,7 @@ obj_lookupSetter(JSContext *cx, unsigned argc, Value *vp)
         return false;
     args.rval().setUndefined();
     if (shape) {
-        if (pobj->isNative() && !IsImplicitDenseElement(shape)) {
+        if (pobj->isNative() && !IsImplicitDenseOrTypedArrayElement(shape)) {
             if (shape->hasSetterValue())
                 args.rval().set(shape->setterValue());
         }
@@ -523,6 +539,60 @@ obj_getPrototypeOf(JSContext *cx, unsigned argc, Value *vp)
     return true;
 }
 
+static bool
+obj_setPrototypeOf(JSContext *cx, unsigned argc, Value *vp)
+{
+    CallArgs args = CallArgsFromVp(argc, vp);
+
+    RootedObject setPrototypeOf(cx, &args.callee());
+    if (!GlobalObject::warnOnceAboutPrototypeMutation(cx, setPrototypeOf))
+        return false;
+
+    if (args.length() < 2) {
+        JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_MORE_ARGS_NEEDED,
+                             "Object.setPrototypeOf", "1", "");
+        return false;
+    }
+
+    /* Step 1-2. */
+    if (args[0].isNullOrUndefined()) {
+        JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_CANT_CONVERT_TO,
+                             args[0].isNull() ? "null" : "undefined", "object");
+        return false;
+    }
+
+    /* Step 3. */
+    if (!args[1].isObjectOrNull()) {
+        JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_NOT_EXPECTED_TYPE,
+                             "Object.setPrototypeOf", "an object or null", InformalValueTypeName(args[1]));
+        return false;
+    }
+
+    /* Step 4. */
+    if (!args[0].isObject()) {
+        args.rval().set(args[0]);
+        return true;
+    }
+
+    /* Step 5-6. */
+    RootedObject obj(cx, &args[0].toObject());
+    RootedObject newProto(cx, args[1].toObjectOrNull());
+
+    bool success;
+    if (!JSObject::setProto(cx, obj, newProto, &success))
+        return false;
+
+    /* Step 7. */
+    if (!success) {
+        JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_OBJECT_NOT_EXTENSIBLE, "object");
+        return false;
+    }
+
+    /* Step 8. */
+    args.rval().set(args[0]);
+    return true;
+}
+
 #if JS_HAS_OBJ_WATCHPOINT
 
 bool
@@ -556,10 +626,8 @@ obj_watch(JSContext *cx, unsigned argc, Value *vp)
     if (!obj)
         return false;
 
-#if 0 /* pending addressing Firebug's use of this method */
     if (!GlobalObject::warnOnceAboutWatch(cx, obj))
         return false;
-#endif
 
     if (args.length() <= 1) {
         js_ReportMissingArg(cx, args.calleev(), 1);
@@ -572,11 +640,6 @@ obj_watch(JSContext *cx, unsigned argc, Value *vp)
 
     RootedId propid(cx);
     if (!ValueToId<CanGC>(cx, args[0], &propid))
-        return false;
-
-    RootedValue tmp(cx);
-    unsigned attrs;
-    if (!CheckAccess(cx, obj, propid, JSACC_WATCH, &tmp, &attrs))
         return false;
 
     if (!JSObject::watch(cx, obj, propid, callable))
@@ -595,10 +658,8 @@ obj_unwatch(JSContext *cx, unsigned argc, Value *vp)
     if (!obj)
         return false;
 
-#if 0 /* pending addressing Firebug's use of this method */
     if (!GlobalObject::warnOnceAboutWatch(cx, obj))
         return false;
-#endif
 
     RootedId id(cx);
     if (args.length() != 0) {
@@ -649,8 +710,6 @@ obj_hasOwnProperty(JSContext *cx, unsigned argc, Value *vp)
         return false;
 
     /* Non-standard code for proxies. */
-    RootedObject obj2(cx);
-    RootedShape prop(cx);
     if (obj->is<ProxyObject>()) {
         bool has;
         if (!Proxy::hasOwn(cx, obj, idRoot, &has))
@@ -660,10 +719,12 @@ obj_hasOwnProperty(JSContext *cx, unsigned argc, Value *vp)
     }
 
     /* Step 3. */
-    if (!HasOwnProperty<CanGC>(cx, obj->getOps()->lookupGeneric, obj, idRoot, &obj2, &prop))
+    bool found;
+    if (!HasOwnProperty(cx, obj, idRoot, &found))
         return false;
+
     /* Step 4,5. */
-    args.rval().setBoolean(!!prop);
+    args.rval().setBoolean(found);
     return true;
 }
 
@@ -696,13 +757,13 @@ obj_isPrototypeOf(JSContext *cx, unsigned argc, Value *vp)
 static bool
 obj_create(JSContext *cx, unsigned argc, Value *vp)
 {
-    if (argc == 0) {
+    CallArgs args = CallArgsFromVp(argc, vp);
+    if (args.length() == 0) {
         JS_ReportErrorNumber(cx, js_GetErrorMessage, nullptr, JSMSG_MORE_ARGS_NEEDED,
                              "Object.create", "0", "s");
         return false;
     }
 
-    CallArgs args = CallArgsFromVp(argc, vp);
     RootedValue v(cx, args[0]);
     if (!v.isObjectOrNull()) {
         char *bytes = DecompileValueGenerator(cx, JSDVG_SEARCH_STACK, v, NullPtr());
@@ -1007,6 +1068,7 @@ const JSFunctionSpec js::object_methods[] = {
 
 const JSFunctionSpec js::object_static_methods[] = {
     JS_FN("getPrototypeOf",            obj_getPrototypeOf,          1,0),
+    JS_FN("setPrototypeOf",            obj_setPrototypeOf,          2,0),
     JS_FN("getOwnPropertyDescriptor",  obj_getOwnPropertyDescriptor,2,0),
     JS_FN("keys",                      obj_keys,                    1,0),
     JS_FN("is",                        obj_is,                      2,0),

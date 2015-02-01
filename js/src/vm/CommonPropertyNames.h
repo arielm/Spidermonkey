@@ -17,7 +17,9 @@
     macro(apply, apply, "apply") \
     macro(arguments, arguments, "arguments") \
     macro(as, as, "as") \
+    macro(ArrayIteratorNext, ArrayIteratorNext, "ArrayIteratorNext") \
     macro(ArrayType, ArrayType, "ArrayType") \
+    macro(ArrayValues, ArrayValues, "ArrayValues") \
     macro(buffer, buffer, "buffer") \
     macro(builder, builder, "builder") \
     macro(byteLength, byteLength, "byteLength") \
@@ -52,6 +54,7 @@
     macro(defineSetter, defineSetter, "__defineSetter__") \
     macro(delete, delete_, "delete") \
     macro(deleteProperty, deleteProperty, "deleteProperty") \
+    macro(displayURL, displayURL, "displayURL") \
     macro(done, done, "done") \
     macro(each, each, "each") \
     macro(elementType, elementType, "elementType") \
@@ -63,7 +66,6 @@
     macro(escape, escape, "escape") \
     macro(eval, eval, "eval") \
     macro(false, false_, "false") \
-    macro(fieldNames, fieldNames, "fieldNames") \
     macro(fieldOffsets, fieldOffsets, "fieldOffsets") \
     macro(fieldTypes, fieldTypes, "fieldTypes") \
     macro(fileName, fileName, "fileName") \
@@ -101,12 +103,14 @@
     macro(int8, int8, "int8") \
     macro(int16, int16, "int16") \
     macro(int32, int32, "int32") \
+    macro(isExtensible, isExtensible, "isExtensible") \
     macro(iterator, iterator, "iterator") \
     macro(iteratorIntrinsic, iteratorIntrinsic, "__iterator__") \
     macro(join, join, "join") \
     macro(keys, keys, "keys") \
     macro(lastIndex, lastIndex, "lastIndex") \
     macro(length, length, "length") \
+    macro(let, let, "let") \
     macro(line, line, "line") \
     macro(lineNumber, lineNumber, "lineNumber") \
     macro(loc, loc, "loc") \
@@ -124,14 +128,26 @@
     macro(name, name, "name") \
     macro(NaN, NaN, "NaN") \
     macro(next, next, "next") \
+    macro(NFC, NFC, "NFC") \
+    macro(NFD, NFD, "NFD") \
+    macro(NFKC, NFKC, "NFKC") \
+    macro(NFKD, NFKD, "NFKD") \
     macro(noSuchMethod, noSuchMethod, "__noSuchMethod__") \
     macro(NumberFormat, NumberFormat, "NumberFormat") \
     macro(NumberFormatFormatGet, NumberFormatFormatGet, "Intl_NumberFormat_format_get") \
     macro(numeric, numeric, "numeric") \
+    macro(objectArray, objectArray, "[object Array]") \
+    macro(objectFunction, objectFunction, "[object Function]") \
     macro(objectNull, objectNull, "[object Null]") \
+    macro(objectNumber, objectNumber, "[object Number]") \
+    macro(objectObject, objectObject, "[object Object]") \
+    macro(objectString, objectString, "[object String]") \
     macro(objectUndefined, objectUndefined, "[object Undefined]") \
+    macro(objectWindow, objectWindow, "[object Window]") \
     macro(of, of, "of") \
     macro(offset, offset, "offset") \
+    macro(optimizedOut, optimizedOut, "optimizedOut") \
+    macro(missingArguments, missingArguments, "missingArguments") \
     macro(outOfMemory, outOfMemory, "out of memory") \
     macro(parseFloat, parseFloat, "parseFloat") \
     macro(parseInt, parseInt, "parseInt") \

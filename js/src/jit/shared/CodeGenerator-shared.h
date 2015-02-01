@@ -15,7 +15,7 @@
 #include "jit/MIRGenerator.h"
 #include "jit/MIRGraph.h"
 #include "jit/Safepoints.h"
-#include "jit/SnapshotWriter.h"
+#include "jit/Snapshots.h"
 #include "jit/VMFunctions.h"
 #include "vm/ForkJoin.h"
 
@@ -45,6 +45,11 @@ struct PatchableBackedgeInfo
     {}
 };
 
+struct ReciprocalMulConstants {
+    int32_t multiplier;
+    int32_t shiftAmount;
+};
+
 class CodeGeneratorShared : public LInstructionVisitor
 {
     js::Vector<OutOfLineCode *, 0, SystemAllocPolicy> outOfLineCode_;
@@ -61,7 +66,8 @@ class CodeGeneratorShared : public LInstructionVisitor
     LIRGraph &graph;
     LBlock *current;
     SnapshotWriter snapshots_;
-    IonCode *deoptTable_;
+    RecoverWriter recovers_;
+    JitCode *deoptTable_;
 #ifdef DEBUG
     uint32_t pushedArgs_;
 #endif
@@ -87,6 +93,11 @@ class CodeGeneratorShared : public LInstructionVisitor
 
     // Patchable backedges generated for loops.
     Vector<PatchableBackedgeInfo, 0, SystemAllocPolicy> patchableBackedges_;
+
+#ifdef JS_TRACE_LOGGING
+    js::Vector<CodeOffsetLabel, 0, SystemAllocPolicy> patchableTraceLoggers_;
+    js::Vector<CodeOffsetLabel, 0, SystemAllocPolicy> patchableTLScripts_;
+#endif
 
     // When profiling is enabled, this is the instrumentation manager which
     // maintains state of what script is currently being generated (for inline
@@ -150,7 +161,7 @@ class CodeGeneratorShared : public LInstructionVisitor
 
     inline int32_t SlotToStackOffset(int32_t slot) const {
         JS_ASSERT(slot > 0 && slot <= int32_t(graph.localSlotCount()));
-        int32_t offset = masm.framePushed() - (slot * STACK_SLOT_SIZE);
+        int32_t offset = masm.framePushed() - slot;
         JS_ASSERT(offset >= 0);
         return offset;
     }
@@ -158,11 +169,10 @@ class CodeGeneratorShared : public LInstructionVisitor
         // See: SlotToStackOffset. This is used to convert pushed arguments
         // to a slot index that safepoints can use.
         //
-        // offset = framePushed - (slot * STACK_SLOT_SIZE)
-        // offset + (slot * STACK_SLOT_SIZE) = framePushed
-        // slot * STACK_SLOT_SIZE = framePushed - offset
-        // slot = (framePushed - offset) / STACK_SLOT_SIZE
-        return (masm.framePushed() - offset) / STACK_SLOT_SIZE;
+        // offset = framePushed - slot
+        // offset + slot = framePushed
+        // slot = framePushed - offset
+        return masm.framePushed() - offset;
     }
 
     // For argument construction for calls. Argslots are Value-sized.
@@ -170,16 +180,17 @@ class CodeGeneratorShared : public LInstructionVisitor
         // A slot of 0 is permitted only to calculate %esp offset for calls.
         JS_ASSERT(slot >= 0 && slot <= int32_t(graph.argumentSlotCount()));
         int32_t offset = masm.framePushed() -
-                       (graph.localSlotCount() * STACK_SLOT_SIZE) -
+                       graph.paddedLocalSlotsSize() -
                        (slot * sizeof(Value));
+
         // Passed arguments go below A function's local stack storage.
         // When arguments are being pushed, there is nothing important on the stack.
         // Therefore, It is safe to push the arguments down arbitrarily.  Pushing
-        // by 8 is desirable since everything on the stack is a Value, which is 8
-        // bytes large.
-
-        offset &= ~7;
+        // by sizeof(Value) is desirable since everything on the stack is a Value.
+        // Note that paddedLocalSlotCount() aligns to at least a Value boundary
+        // specifically to support this.
         JS_ASSERT(offset >= 0);
+        JS_ASSERT(offset % sizeof(Value) == 0);
         return offset;
     }
 
@@ -248,6 +259,8 @@ class CodeGeneratorShared : public LInstructionVisitor
     template <typename T>
     inline size_t allocateCache(const T &cache) {
         size_t index = allocateCache(cache, sizeof(mozilla::AlignedStorage2<T>));
+        if (masm.oom())
+            return SIZE_MAX;
         // Use the copy constructor on the allocated space.
         JS_ASSERT(index == cacheList_.back());
         new (&runtimeData_[index]) T(cache);
@@ -257,8 +270,9 @@ class CodeGeneratorShared : public LInstructionVisitor
   protected:
     // Encodes an LSnapshot into the compressed snapshot buffer, returning
     // false on failure.
+    bool encode(LRecoverInfo *recover);
     bool encode(LSnapshot *snapshot);
-    bool encodeSlots(LSnapshot *snapshot, MResumePoint *resumePoint, uint32_t *startIndex);
+    bool encodeAllocations(LSnapshot *snapshot, MResumePoint *resumePoint, uint32_t *startIndex);
 
     // Attempts to assign a BailoutId to a snapshot, if one isn't already set.
     // If the bailout table is full, this returns false, which is not a fatal
@@ -295,7 +309,7 @@ class CodeGeneratorShared : public LInstructionVisitor
     void emitPreBarrier(Address address, MIRType type);
 
     inline bool isNextBlock(LBlock *block) {
-        return (current->mir()->id() + 1 == block->mir()->id());
+        return current->mir()->id() + 1 == block->mir()->id();
     }
 
   public:
@@ -349,6 +363,10 @@ class CodeGeneratorShared : public LInstructionVisitor
     inline void restoreLive(LInstruction *ins);
     inline void restoreLiveIgnore(LInstruction *ins, RegisterSet reg);
 
+    // Save/restore all registers that are both live and volatile.
+    inline void saveLiveVolatile(LInstruction *ins);
+    inline void restoreLiveVolatile(LInstruction *ins);
+
     template <typename T>
     void pushArg(const T &t) {
         masm.Push(t);
@@ -389,6 +407,7 @@ class CodeGeneratorShared : public LInstructionVisitor
 
     bool addCache(LInstruction *lir, size_t cacheIndex);
     size_t addCacheLocations(const CacheLocationList &locs, size_t *numLocs);
+    ReciprocalMulConstants computeDivisionConstants(int d);
 
   protected:
     bool addOutOfLineCode(OutOfLineCode *code);
@@ -416,6 +435,8 @@ class CodeGeneratorShared : public LInstructionVisitor
 
     bool visitOutOfLineTruncateSlow(OutOfLineTruncateSlow *ool);
 
+    bool omitOverRecursedCheck() const;
+
   public:
     bool callTraceLIR(uint32_t blockIndex, LInstruction *lir, const char *bailoutName = nullptr);
 
@@ -437,6 +458,26 @@ class CodeGeneratorShared : public LInstructionVisitor
     OutOfLinePropagateAbortPar *oolPropagateAbortPar(LInstruction *lir);
     virtual bool visitOutOfLineAbortPar(OutOfLineAbortPar *ool) = 0;
     virtual bool visitOutOfLinePropagateAbortPar(OutOfLinePropagateAbortPar *ool) = 0;
+
+#ifdef JS_TRACE_LOGGING
+  protected:
+    bool emitTracelogScript(bool isStart);
+    bool emitTracelogTree(bool isStart, uint32_t textId);
+
+  public:
+    bool emitTracelogScriptStart() {
+        return emitTracelogScript(/* isStart =*/ true);
+    }
+    bool emitTracelogScriptStop() {
+        return emitTracelogScript(/* isStart =*/ false);
+    }
+    bool emitTracelogStartEvent(uint32_t textId) {
+        return emitTracelogTree(/* isStart =*/ true, textId);
+    }
+    bool emitTracelogStopEvent(uint32_t textId) {
+        return emitTracelogTree(/* isStart =*/ false, textId);
+    }
+#endif
 };
 
 // An out-of-line path is generated at the end of the function.

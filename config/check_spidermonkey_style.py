@@ -63,7 +63,6 @@ included_inclnames_to_ignore = set([
     'double-conversion.h',      # strange MFBT case
     'javascript-trace.h',       # generated in $OBJDIR if HAVE_DTRACE is defined
     'jsautokw.h',               # generated in $OBJDIR
-    'jsautooplen.h',            # generated in $OBJDIR
     'jscustomallocator.h',      # provided by embedders;  allowed to be missing
     'js-config.h',              # generated in $OBJDIR
     'pratom.h',                 # NSPR
@@ -83,6 +82,7 @@ included_inclnames_to_ignore = set([
     'unicode/udat.h',           # ICU
     'unicode/udatpg.h',         # ICU
     'unicode/uenum.h',          # ICU
+    'unicode/unorm.h',          # ICU
     'unicode/unum.h',           # ICU
     'unicode/ustring.h',        # ICU
     'unicode/utypes.h',         # ICU
@@ -201,7 +201,7 @@ class FileKind(object):
         if filename.endswith('.cpp'):
             return FileKind.CPP
 
-        if filename.endswith(('inlines.h', '-inl.h', 'Inlines.h')):
+        if filename.endswith(('inlines.h', '-inl.h')):
             return FileKind.INL_H
 
         if filename.endswith('.h'):

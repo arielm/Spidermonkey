@@ -6,7 +6,7 @@
 
 BEGIN_TEST(testJSEvaluateScript)
 {
-    JS::RootedObject obj(cx, JS_NewObject(cx, nullptr, nullptr, global));
+    JS::RootedObject obj(cx, JS_NewObject(cx, nullptr, JS::NullPtr(), global));
     CHECK(obj);
 
     CHECK(JS::ContextOptionsRef(cx).varObjFix());
@@ -14,8 +14,7 @@ BEGIN_TEST(testJSEvaluateScript)
     static const char src[] = "var x = 5;";
 
     JS::RootedValue retval(cx);
-    CHECK(JS_EvaluateScript(cx, obj, src, sizeof(src) - 1, __FILE__, __LINE__,
-                            retval.address()));
+    CHECK(JS_EvaluateScript(cx, obj, src, sizeof(src) - 1, __FILE__, __LINE__, &retval));
 
     bool hasProp = true;
     CHECK(JS_AlreadyHasOwnProperty(cx, obj, "x", &hasProp));
@@ -30,8 +29,7 @@ BEGIN_TEST(testJSEvaluateScript)
 
     static const char src2[] = "var y = 5;";
 
-    CHECK(JS_EvaluateScript(cx, obj, src2, sizeof(src2) - 1, __FILE__, __LINE__,
-                            retval.address()));
+    CHECK(JS_EvaluateScript(cx, obj, src2, sizeof(src2) - 1, __FILE__, __LINE__, &retval));
 
     hasProp = false;
     CHECK(JS_AlreadyHasOwnProperty(cx, obj, "y", &hasProp));

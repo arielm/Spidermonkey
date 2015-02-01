@@ -7,6 +7,8 @@
 #ifndef jit_IonAnalysis_h
 #define jit_IonAnalysis_h
 
+#ifdef JS_ION
+
 // This file declares various analysis passes that operate on MIR.
 
 #include "jit/IonAllocPolicy.h"
@@ -37,6 +39,9 @@ EliminateDeadCode(MIRGenerator *mir, MIRGraph &graph);
 
 bool
 ApplyTypeInformation(MIRGenerator *mir, MIRGraph &graph);
+
+bool
+MakeMRegExpHoistable(MIRGraph &graph);
 
 bool
 RenumberBlocks(MIRGraph &graph);
@@ -129,11 +134,16 @@ class LinearSum
 };
 
 bool
-AnalyzeNewScriptProperties(JSContext *cx, HandleFunction fun,
+AnalyzeNewScriptProperties(JSContext *cx, JSFunction *fun,
                            types::TypeObject *type, HandleObject baseobj,
                            Vector<types::TypeNewScript::Initializer> *initializerList);
 
+bool
+AnalyzeArgumentsUsage(JSContext *cx, JSScript *script);
+
 } // namespace jit
 } // namespace js
+
+#endif // JS_ION
 
 #endif /* jit_IonAnalysis_h */

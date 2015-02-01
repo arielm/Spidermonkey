@@ -32,16 +32,28 @@ class TempAllocator
         rootList_(nullptr)
     { }
 
-    void *allocateInfallible(size_t bytes)
+    void *allocateOrCrash(size_t bytes)
     {
-        void *p = lifoScope_.alloc().allocInfallible(bytes);
-        JS_ASSERT(p);
+        void *p = lifoScope_.alloc().alloc(bytes);
+        if (!p)
+            js::CrashAtUnhandlableOOM("LifoAlloc::allocOrCrash");
         return p;
     }
 
     void *allocate(size_t bytes)
     {
         void *p = lifoScope_.alloc().alloc(bytes);
+        if (!ensureBallast())
+            return nullptr;
+        return p;
+    }
+
+    template <size_t ElemSize>
+    void *allocateArray(size_t n)
+    {
+        if (n & mozilla::tl::MulOverflowMask<ElemSize>::value)
+            return nullptr;
+        void *p = lifoScope_.alloc().alloc(n * ElemSize);
         if (!ensureBallast())
             return nullptr;
         return p;
@@ -166,7 +178,7 @@ class AutoIonContextAlloc
 struct TempObject
 {
     inline void *operator new(size_t nbytes, TempAllocator &alloc) {
-        return alloc.allocateInfallible(nbytes);
+        return alloc.allocateOrCrash(nbytes);
     }
     template <class T>
     inline void *operator new(size_t nbytes, T *pos) {

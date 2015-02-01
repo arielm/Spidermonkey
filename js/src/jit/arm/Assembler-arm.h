@@ -80,7 +80,6 @@ class ABIArgGenerator
     uint32_t stackBytesConsumedSoFar() const { return stackOffset_; }
     static const Register NonArgReturnVolatileReg0;
     static const Register NonArgReturnVolatileReg1;
-
 };
 
 static MOZ_CONSTEXPR_VAR Register PreBarrierReg = r1;
@@ -97,6 +96,22 @@ static MOZ_CONSTEXPR_VAR FloatRegister ReturnFloatReg = { FloatRegisters::d0 };
 static MOZ_CONSTEXPR_VAR FloatRegister ScratchFloatReg = { FloatRegisters::d15 };
 
 static MOZ_CONSTEXPR_VAR FloatRegister NANReg = { FloatRegisters::d14 };
+
+// Registers used in the GenerateFFIIonExit Enable Activation block.
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegCallee = r4;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE0 = r0;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE1 = r1;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE2 = r2;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegE3 = r3;
+
+// Registers used in the GenerateFFIIonExit Disable Activation block.
+// None of these may be the second scratch register (lr).
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegReturnData = r2;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegReturnType = r3;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegD0 = r0;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegD1 = r1;
+static MOZ_CONSTEXPR_VAR Register AsmJSIonExitRegD2 = r4;
+
 
 static MOZ_CONSTEXPR_VAR FloatRegister d0  = {FloatRegisters::d0};
 static MOZ_CONSTEXPR_VAR FloatRegister d1  = {FloatRegisters::d1};
@@ -727,7 +742,6 @@ class O2RegImmShift : public Op2Reg
         datastore::Reg r(*this);
         datastore::RIS ris(r);
         return ris.ShiftAmount;
-        
     }
 };
 
@@ -972,7 +986,8 @@ class BOffImm
       : data ((offset - 8) >> 2 & 0x00ffffff)
     {
         JS_ASSERT((offset & 0x3) == 0);
-        JS_ASSERT(isInRange(offset));
+        if (!isInRange(offset))
+            CrashAtUnhandlableOOM("BOffImm");
     }
     static bool isInRange(int offset)
     {
@@ -1019,15 +1034,6 @@ class Imm16
     bool isInvalid () {
         return invalid;
     }
-};
-
-// FP Instructions use a different set of registers,
-// with a different encoding, so this calls for a different class.
-// which will be implemented later
-// IIRC, this has been subsumed by vfpreg.
-class FloatOp
-{
-    uint32_t data;
 };
 
 /* I would preffer that these do not exist, since there are essentially
@@ -1121,7 +1127,7 @@ class InstructionIterator;
 class Assembler;
 typedef js::jit::AssemblerBufferWithConstantPool<1024, 4, Instruction, Assembler, 1> ARMBuffer;
 
-class Assembler
+class Assembler : public AssemblerShared
 {
   public:
     // ARM conditional constants
@@ -1226,7 +1232,7 @@ class Assembler
     void resetCounter();
     uint32_t actualOffset(uint32_t) const;
     uint32_t actualIndex(uint32_t) const;
-    static uint8_t *PatchableJumpAddress(IonCode *code, uint32_t index);
+    static uint8_t *PatchableJumpAddress(JitCode *code, uint32_t index);
     BufferOffset actualOffset(BufferOffset) const;
   protected:
 
@@ -1234,18 +1240,10 @@ class Assembler
     // gets moved (executable copy, gc, etc.)
     struct RelativePatch
     {
-        // the offset within the code buffer where the value is loaded that
-        // we want to fix-up
-        BufferOffset offset;
         void *target;
         Relocation::Kind kind;
-        void fixOffset(ARMBuffer &m_buffer) {
-            offset = BufferOffset(offset.getOffset() + m_buffer.poolSizeBefore(offset.getOffset()));
-        }
-        RelativePatch(BufferOffset offset, void *target, Relocation::Kind kind)
-          : offset(offset),
-            target(target),
-            kind(kind)
+        RelativePatch(void *target, Relocation::Kind kind)
+            : target(target), kind(kind)
         { }
     };
 
@@ -1256,7 +1254,6 @@ class Assembler
     js::Vector<BufferOffset, 0, SystemAllocPolicy> tmpJumpRelocations_;
     js::Vector<BufferOffset, 0, SystemAllocPolicy> tmpDataRelocations_;
     js::Vector<BufferOffset, 0, SystemAllocPolicy> tmpPreBarriers_;
-    AsmJSAbsoluteLinkVector asmJSAbsoluteLinks_;
 
     CompactBufferWriter jumpRelocations_;
     CompactBufferWriter dataRelocations_;
@@ -1278,7 +1275,7 @@ class Assembler
     // dest parameter, a this object is still needed.  dummy always happens
     // to be null, but we shouldn't be looking at it in any case.
     static Assembler *dummy;
-    Pool pools_[4];
+    mozilla::Array<Pool, 4> pools_;
     Pool *int32Pool;
     Pool *doublePool;
 
@@ -1299,17 +1296,12 @@ class Assembler
     void initWithAllocator() {
         m_buffer.initWithAllocator();
 
-        // Note that the sizes for the double pools are set to 1020 rather than 1024 to
-        // work around a rare edge case that would otherwise bail out - which is not
-        // possible for Asm.js code and causes a compilation failure.  See the comment at
-        // the fail_bail call within IonAssemberBufferWithConstantPools.h: finishPool().
-
         // Set up the backwards double region
-        new (&pools_[2]) Pool (1020, 8, 4, 8, 8, m_buffer.LifoAlloc_, true);
+        new (&pools_[2]) Pool (1024, 8, 4, 8, 8, m_buffer.LifoAlloc_, true);
         // Set up the backwards 32 bit region
         new (&pools_[3]) Pool (4096, 4, 4, 8, 4, m_buffer.LifoAlloc_, true, true);
         // Set up the forwards double region
-        new (doublePool) Pool (1020, 8, 4, 8, 8, m_buffer.LifoAlloc_, false, false, &pools_[2]);
+        new (doublePool) Pool (1024, 8, 4, 8, 8, m_buffer.LifoAlloc_, false, false, &pools_[2]);
         // Set up the forwards 32 bit region
         new (int32Pool) Pool (4096, 4, 4, 8, 4, m_buffer.LifoAlloc_, false, true, &pools_[3]);
         for (int i = 0; i < 4; i++) {
@@ -1381,13 +1373,6 @@ class Assembler
     }
     CodeLabel codeLabel(size_t i) {
         return codeLabels_[i];
-    }
-
-    size_t numAsmJSAbsoluteLinks() const {
-        return asmJSAbsoluteLinks_.length();
-    }
-    AsmJSAbsoluteLink asmJSAbsoluteLink(size_t i) const {
-        return asmJSAbsoluteLinks_[i];
     }
 
     // Size of the instruction stream, in bytes.
@@ -1498,14 +1483,14 @@ class Assembler
     //overwrite a pool entry with new data.
     void as_WritePoolEntry(Instruction *addr, Condition c, uint32_t data);
     // load a 32 bit immediate from a pool into a register
-    BufferOffset as_Imm32Pool(Register dest, uint32_t value, ARMBuffer::PoolEntry *pe = nullptr, Condition c = Always);
+    BufferOffset as_Imm32Pool(Register dest, uint32_t value, Condition c = Always);
     // make a patchable jump that can target the entire 32 bit address space.
     BufferOffset as_BranchPool(uint32_t value, RepatchLabel *label, ARMBuffer::PoolEntry *pe = nullptr, Condition c = Always);
 
     // load a 64 bit floating point immediate from a pool into a register
-    BufferOffset as_FImm64Pool(VFPRegister dest, double value, ARMBuffer::PoolEntry *pe = nullptr, Condition c = Always);
+    BufferOffset as_FImm64Pool(VFPRegister dest, double value, Condition c = Always);
     // load a 32 bit floating point immediate from a pool into a register
-    BufferOffset as_FImm32Pool(VFPRegister dest, float value, ARMBuffer::PoolEntry *pe = nullptr, Condition c = Always);
+    BufferOffset as_FImm32Pool(VFPRegister dest, float value, Condition c = Always);
 
     // Control flow stuff:
 
@@ -1655,13 +1640,13 @@ class Assembler
     void as_bkpt();
 
   public:
-    static void TraceJumpRelocations(JSTracer *trc, IonCode *code, CompactBufferReader &reader);
-    static void TraceDataRelocations(JSTracer *trc, IonCode *code, CompactBufferReader &reader);
+    static void TraceJumpRelocations(JSTracer *trc, JitCode *code, CompactBufferReader &reader);
+    static void TraceDataRelocations(JSTracer *trc, JitCode *code, CompactBufferReader &reader);
 
   protected:
     void addPendingJump(BufferOffset src, ImmPtr target, Relocation::Kind kind) {
-        enoughMemory_ &= jumps_.append(RelativePatch(src, target.value, kind));
-        if (kind == Relocation::IONCODE)
+        enoughMemory_ &= jumps_.append(RelativePatch(target.value, kind));
+        if (kind == Relocation::JITCODE)
             writeRelocation(src);
     }
 
@@ -2107,11 +2092,10 @@ class InstructionIterator {
 static const uint32_t NumIntArgRegs = 4;
 static const uint32_t NumFloatArgRegs = 8;
 
-#ifdef JS_CPU_ARM_HARDFP
 static inline bool
 GetIntArgReg(uint32_t usedIntArgs, uint32_t usedFloatArgs, Register *out)
 {
-   if (usedIntArgs >= NumIntArgRegs)
+    if (usedIntArgs >= NumIntArgRegs)
         return false;
     *out = Register::FromCode(usedIntArgs);
     return true;
@@ -2137,9 +2121,26 @@ GetTempRegForIntArg(uint32_t usedIntArgs, uint32_t usedFloatArgs, Register *out)
     return true;
 }
 
+
+#if !defined(JS_CODEGEN_ARM_HARDFP) || defined(JS_ARM_SIMULATOR)
+
+static inline uint32_t
+GetArgStackDisp(uint32_t arg)
+{
+    JS_ASSERT(!useHardFpABI());
+    JS_ASSERT(arg >= NumIntArgRegs);
+    return (arg - NumIntArgRegs) * sizeof(intptr_t);
+}
+
+#endif
+
+
+#if defined(JS_CODEGEN_ARM_HARDFP) || defined(JS_ARM_SIMULATOR)
+
 static inline bool
 GetFloatArgReg(uint32_t usedIntArgs, uint32_t usedFloatArgs, FloatRegister *out)
 {
+    JS_ASSERT(useHardFpABI());
     if (usedFloatArgs >= NumFloatArgRegs)
         return false;
     *out = FloatRegister::FromCode(usedFloatArgs);
@@ -2149,17 +2150,30 @@ GetFloatArgReg(uint32_t usedIntArgs, uint32_t usedFloatArgs, FloatRegister *out)
 static inline uint32_t
 GetIntArgStackDisp(uint32_t usedIntArgs, uint32_t usedFloatArgs, uint32_t *padding)
 {
+    JS_ASSERT(useHardFpABI());
     JS_ASSERT(usedIntArgs >= NumIntArgRegs);
     uint32_t doubleSlots = Max(0, (int32_t)usedFloatArgs - (int32_t)NumFloatArgRegs);
     doubleSlots *= 2;
     int intSlots = usedIntArgs - NumIntArgRegs;
-    return (intSlots + doubleSlots + *padding) * STACK_SLOT_SIZE;
+    return (intSlots + doubleSlots + *padding) * sizeof(intptr_t);
 }
 
 static inline uint32_t
-GetFloatArgStackDisp(uint32_t usedIntArgs, uint32_t usedFloatArgs, uint32_t *padding)
+GetFloat32ArgStackDisp(uint32_t usedIntArgs, uint32_t usedFloatArgs, uint32_t *padding)
 {
+    JS_ASSERT(useHardFpABI());
+    JS_ASSERT(usedFloatArgs >= NumFloatArgRegs);
+    uint32_t intSlots = 0;
+    if (usedIntArgs > NumIntArgRegs)
+        intSlots = usedIntArgs - NumIntArgRegs;
+    uint32_t float32Slots = usedFloatArgs - NumFloatArgRegs;
+    return (intSlots + float32Slots + *padding) * sizeof(intptr_t);
+}
 
+static inline uint32_t
+GetDoubleArgStackDisp(uint32_t usedIntArgs, uint32_t usedFloatArgs, uint32_t *padding)
+{
+    JS_ASSERT(useHardFpABI());
     JS_ASSERT(usedFloatArgs >= NumFloatArgRegs);
     uint32_t intSlots = 0;
     if (usedIntArgs > NumIntArgRegs) {
@@ -2169,47 +2183,12 @@ GetFloatArgStackDisp(uint32_t usedIntArgs, uint32_t usedFloatArgs, uint32_t *pad
     }
     uint32_t doubleSlots = usedFloatArgs - NumFloatArgRegs;
     doubleSlots *= 2;
-    return (intSlots + doubleSlots + *padding) * STACK_SLOT_SIZE;
-}
-#else
-static inline bool
-GetIntArgReg(uint32_t arg, uint32_t floatArg, Register *out)
-{
-    if (arg < NumIntArgRegs) {
-        *out = Register::FromCode(arg);
-        return true;
-    }
-    return false;
-}
-
-// Get a register in which we plan to put a quantity that will be used as an
-// integer argument.  This differs from GetIntArgReg in that if we have no more
-// actual argument registers to use we will fall back on using whatever
-// CallTempReg* don't overlap the argument registers, and only fail once those
-// run out too.
-static inline bool
-GetTempRegForIntArg(uint32_t usedIntArgs, uint32_t usedFloatArgs, Register *out)
-{
-    if (GetIntArgReg(usedIntArgs, usedFloatArgs, out))
-        return true;
-    // Unfortunately, we have to assume things about the point at which
-    // GetIntArgReg returns false, because we need to know how many registers it
-    // can allocate.
-    usedIntArgs -= NumIntArgRegs;
-    if (usedIntArgs >= NumCallTempNonArgRegs)
-        return false;
-    *out = CallTempNonArgRegs[usedIntArgs];
-    return true;
-}
-
-static inline uint32_t
-GetArgStackDisp(uint32_t arg)
-{
-    JS_ASSERT(arg >= NumIntArgRegs);
-    return (arg - NumIntArgRegs) * STACK_SLOT_SIZE;
+    return (intSlots + doubleSlots + *padding) * sizeof(intptr_t);
 }
 
 #endif
+
+
 
 class DoubleEncoder {
     uint32_t rep(bool b, uint32_t count) {
@@ -2247,7 +2226,7 @@ class DoubleEncoder {
         { }
     };
 
-    DoubleEntry table[256];
+    mozilla::Array<DoubleEntry, 256> table;
 
   public:
     DoubleEncoder()

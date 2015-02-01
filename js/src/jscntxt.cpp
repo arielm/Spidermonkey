@@ -113,7 +113,7 @@ JSFunction *
 js::ExistingCloneFunctionAtCallsite(const CallsiteCloneTable &table, JSFunction *fun,
                                     JSScript *script, jsbytecode *pc)
 {
-    JS_ASSERT(fun->nonLazyScript()->shouldCloneAtCallsite);
+    JS_ASSERT(fun->nonLazyScript()->shouldCloneAtCallsite());
     JS_ASSERT(!fun->nonLazyScript()->enclosingStaticScope());
     JS_ASSERT(types::UseNewTypeForClone(fun));
 
@@ -126,7 +126,7 @@ js::ExistingCloneFunctionAtCallsite(const CallsiteCloneTable &table, JSFunction 
     if (!table.initialized())
         return nullptr;
 
-    CallsiteCloneTable::Ptr p = table.lookup(CallsiteCloneKey(fun, script, script->pcToOffset(pc)));
+    CallsiteCloneTable::Ptr p = table.readonlyThreadsafeLookup(CallsiteCloneKey(fun, script, script->pcToOffset(pc)));
     if (p)
         return p->value();
 
@@ -148,9 +148,7 @@ js::CloneFunctionAtCallsite(JSContext *cx, HandleFunction fun, HandleScript scri
      * Store a link back to the original for function.caller and avoid cloning
      * clones.
      */
-    clone->nonLazyScript()->shouldCloneAtCallsite = false;
-    clone->nonLazyScript()->isCallsiteClone = true;
-    clone->nonLazyScript()->setOriginalFunctionObject(fun);
+    clone->nonLazyScript()->setIsCallsiteClone(fun);
 
     typedef CallsiteCloneKey Key;
     typedef CallsiteCloneTable Table;
@@ -196,11 +194,12 @@ js::NewContext(JSRuntime *rt, size_t stackChunkSize)
 #ifdef JS_THREADSAFE
         JS_BeginRequest(cx);
 #endif
-        bool ok = rt->staticStrings.init(cx);
-        if (ok)
-            ok = InitCommonNames(cx);
+        bool ok = rt->initializeAtoms(cx);
         if (ok)
             ok = rt->initSelfHosting(cx);
+
+        if (ok && !rt->parentRuntime)
+            ok = rt->transformToPermanentAtoms();
 
 #ifdef JS_THREADSAFE
         JS_EndRequest(cx);
@@ -209,6 +208,7 @@ js::NewContext(JSRuntime *rt, size_t stackChunkSize)
             DestroyContext(cx, DCM_NEW_FAILED);
             return nullptr;
         }
+
         rt->haveCreatedContext = true;
     }
 
@@ -232,7 +232,7 @@ js::DestroyContext(JSContext *cx, DestroyContextMode mode)
         MOZ_CRASH();
 #endif
 
-#if (defined(JSGC_ROOT_ANALYSIS) || defined(JSGC_USE_EXACT_ROOTING)) && defined(DEBUG)
+#if defined(JSGC_USE_EXACT_ROOTING) && defined(DEBUG)
     for (int i = 0; i < THING_ROOT_LIMIT; ++i)
         JS_ASSERT(cx->thingGCRooters[i] == nullptr);
 #endif
@@ -292,7 +292,9 @@ ReportError(JSContext *cx, const char *message, JSErrorReport *reportp,
     JS_ASSERT(reportp);
     if ((!callback || callback == js_GetErrorMessage) &&
         reportp->errorNumber == JSMSG_UNCAUGHT_EXCEPTION)
+    {
         reportp->flags |= JSREPORT_EXCEPTION;
+    }
 
     /*
      * Call the error reporter only if an exception wasn't raised.
@@ -302,9 +304,9 @@ ReportError(JSContext *cx, const char *message, JSErrorReport *reportp,
      * propagates out of scope.  This is needed for compatibility
      * with the old scheme.
      */
-    if (!JS_IsRunning(cx) ||
-        !js_ErrorToException(cx, message, reportp, callback, userRef)) {
-        js_ReportErrorAgain(cx, message, reportp);
+    if (!JS_IsRunning(cx) || !js_ErrorToException(cx, message, reportp, callback, userRef)) {
+        if (message)
+            CallErrorReporter(cx, message, reportp);
     } else if (JSDebugErrorHook hook = cx->runtime()->debugHooks.debugErrorHook) {
         /*
          * If we've already chewed up all the C stack, don't call into the
@@ -331,13 +333,13 @@ PopulateReportBlame(JSContext *cx, JSErrorReport *report)
      * Walk stack until we find a frame that is associated with a non-builtin
      * rather than a builtin frame.
      */
-    NonBuiltinScriptFrameIter iter(cx);
+    NonBuiltinFrameIter iter(cx);
     if (iter.done())
         return;
 
-    report->filename = iter.script()->filename();
-    report->lineno = PCToLineNumber(iter.script(), iter.pc(), &report->column);
-    report->originPrincipals = iter.script()->originPrincipals();
+    report->filename = iter.scriptFilename();
+    report->lineno = iter.computeLine(&report->column);
+    report->originPrincipals = iter.originPrincipals();
 }
 
 /*
@@ -361,16 +363,22 @@ js_ReportOutOfMemory(ThreadSafeContext *cxArg)
     fprintf(stderr, "js_ReportOutOfMemory called\n");
 #endif
 
-    if (cxArg->isForkJoinSlice()) {
-        cxArg->asForkJoinSlice()->setPendingAbortFatal(ParallelBailoutOutOfMemory);
+    if (cxArg->isForkJoinContext()) {
+        cxArg->asForkJoinContext()->setPendingAbortFatal(ParallelBailoutOutOfMemory);
         return;
     }
 
     if (!cxArg->isJSContext())
         return;
-    JSContext *cx = cxArg->asJSContext();
 
+    JSContext *cx = cxArg->asJSContext();
     cx->runtime()->hadOutOfMemory = true;
+
+    /* Report the oom. */
+    if (JS::OutOfMemoryCallback oomCallback = cx->runtime()->oomCallback) {
+        AutoSuppressGC suppressGC(cx);
+        oomCallback(cx);
+    }
 
     if (JS_IsRunning(cx)) {
         cx->setPendingException(StringValue(cx->names().outOfMemory));
@@ -441,8 +449,8 @@ js_ReportAllocationOverflow(ThreadSafeContext *cxArg)
     if (!cxArg)
         return;
 
-    if (cxArg->isForkJoinSlice()) {
-        cxArg->asForkJoinSlice()->setPendingAbortFatal(ParallelBailoutOutOfMemory);
+    if (cxArg->isForkJoinContext()) {
+        cxArg->asForkJoinContext()->setPendingAbortFatal(ParallelBailoutOutOfMemory);
         return;
     }
 
@@ -470,7 +478,7 @@ checkReportFlags(JSContext *cx, unsigned *flags)
          * strict if the nearest scripted frame is strict, see bug 536306.
          */
         JSScript *script = cx->currentScript();
-        if (script && script->strict)
+        if (script && script->strict())
             *flags &= ~JSREPORT_WARNING;
         else if (cx->options().extraWarnings())
             *flags |= JSREPORT_WARNING;
@@ -877,26 +885,21 @@ js_ReportErrorNumberUCArray(JSContext *cx, unsigned flags, JSErrorCallback callb
     return warning;
 }
 
-JS_FRIEND_API(void)
-js_ReportErrorAgain(JSContext *cx, const char *message, JSErrorReport *reportp)
+void
+js::CallErrorReporter(JSContext *cx, const char *message, JSErrorReport *reportp)
 {
-    JSErrorReporter onError;
+    JS_ASSERT(message);
+    JS_ASSERT(reportp);
 
-    if (!message)
-        return;
-
-    onError = cx->errorReporter;
-
-    /*
-     * If debugErrorHook is present then we give it a chance to veto
-     * sending the error on to the regular ErrorReporter.
-     */
-    if (onError) {
+    // If debugErrorHook is present, give it a chance to veto sending the error
+    // on to the regular ErrorReporter.
+    if (cx->errorReporter) {
         JSDebugErrorHook hook = cx->runtime()->debugHooks.debugErrorHook;
         if (hook && !hook(cx, message, reportp, cx->runtime()->debugHooks.debugErrorHookData))
-            onError = nullptr;
+            return;
     }
-    if (onError)
+
+    if (JSErrorReporter onError = cx->errorReporter)
         onError(cx, message, reportp);
 }
 
@@ -998,84 +1001,100 @@ js_GetErrorMessage(void *userRef, const char *locale, const unsigned errorNumber
 }
 
 bool
-js_InvokeOperationCallback(JSContext *cx)
+js::InvokeInterruptCallback(JSContext *cx)
 {
     JS_ASSERT_REQUEST_DEPTH(cx);
 
     JSRuntime *rt = cx->runtime();
-    JS_ASSERT(rt->interrupt != 0);
+    JS_ASSERT(rt->interrupt);
 
-    /*
-     * Reset the callback counter first, then run GC and yield. If another
-     * thread is racing us here we will accumulate another callback request
-     * which will be serviced at the next opportunity.
-     */
-    rt->interrupt = 0;
+    // Reset the callback counter first, then run GC and yield. If another
+    // thread is racing us here we will accumulate another callback request
+    // which will be serviced at the next opportunity.
+    rt->interrupt = false;
 
-    /* IonMonkey sets its stack limit to UINTPTR_MAX to trigger operaton callbacks. */
-    rt->resetIonStackLimit();
+    // IonMonkey sets its stack limit to UINTPTR_MAX to trigger interrupt
+    // callbacks.
+    rt->resetJitStackLimit();
 
-    if (rt->gcIsNeeded)
-        GCSlice(rt, GC_NORMAL, rt->gcTriggerReason);
-
-#ifdef JSGC_GENERATIONAL
-    if (rt->gcStoreBuffer.isAboutToOverflow())
-        MinorGC(cx, JS::gcreason::FULL_STORE_BUFFER);
-#endif
+    js::gc::GCIfNeeded(cx);
 
 #ifdef JS_ION
-    /*
-     * A worker thread may have set the callback after finishing an Ion
-     * compilation.
-     */
+#ifdef JS_THREADSAFE
+    rt->interruptPar = false;
+#endif
+
+    // A worker thread may have requested an interrupt after finishing an Ion
+    // compilation.
     jit::AttachFinishedCompilations(cx);
 #endif
 
-    /*
-     * Important: Additional callbacks can occur inside the callback handler
-     * if it re-enters the JS engine. The embedding must ensure that the
-     * callback is disconnected before attempting such re-entry.
-     */
-    JSOperationCallback cb = cx->runtime()->operationCallback;
-    return !cb || cb(cx);
+    // Important: Additional callbacks can occur inside the callback handler
+    // if it re-enters the JS engine. The embedding must ensure that the
+    // callback is disconnected before attempting such re-entry.
+    JSInterruptCallback cb = cx->runtime()->interruptCallback;
+    if (!cb || cb(cx))
+        return true;
+
+    // No need to set aside any pending exception here: ComputeStackString
+    // already does that.
+    Rooted<JSString*> stack(cx, ComputeStackString(cx));
+    const jschar *chars = stack ? stack->getCharsZ(cx) : nullptr;
+    if (!chars)
+        chars = MOZ_UTF16("(stack not available)");
+    JS_ReportErrorFlagsAndNumberUC(cx, JSREPORT_WARNING, js_GetErrorMessage, nullptr,
+                                   JSMSG_TERMINATED, chars);
+
+    return false;
 }
 
 bool
-js_HandleExecutionInterrupt(JSContext *cx)
+js::HandleExecutionInterrupt(JSContext *cx)
 {
     if (cx->runtime()->interrupt)
-        return js_InvokeOperationCallback(cx);
+        return InvokeInterruptCallback(cx);
     return true;
 }
 
-js::ThreadSafeContext::ThreadSafeContext(JSRuntime *rt, PerThreadData *pt, ContextKind kind)
+ThreadSafeContext::ThreadSafeContext(JSRuntime *rt, PerThreadData *pt, ContextKind kind)
   : ContextFriendFields(rt),
     contextKind_(kind),
     perThreadData(pt),
     allocator_(nullptr)
 {
-#ifdef JS_THREADSAFE
-    JS_ASSERT_IF(kind == Context_Exclusive, rt->workerThreadState != nullptr);
-#endif
 }
 
 bool
-ThreadSafeContext::isForkJoinSlice() const
+ThreadSafeContext::isForkJoinContext() const
 {
     return contextKind_ == Context_ForkJoin;
 }
 
-ForkJoinSlice *
-ThreadSafeContext::asForkJoinSlice()
+ForkJoinContext *
+ThreadSafeContext::asForkJoinContext()
 {
-    JS_ASSERT(isForkJoinSlice());
-    return reinterpret_cast<ForkJoinSlice *>(this);
+    JS_ASSERT(isForkJoinContext());
+    return reinterpret_cast<ForkJoinContext *>(this);
+}
+
+void
+ThreadSafeContext::recoverFromOutOfMemory()
+{
+    // If this is not a JSContext, there's nothing to do.
+    if (JSContext *maybecx = maybeJSContext()) {
+        if (maybecx->isExceptionPending()) {
+            MOZ_ASSERT(maybecx->isThrowingOutOfMemory());
+            maybecx->clearPendingException();
+        } else {
+            MOZ_ASSERT(maybecx->runtime()->hadOutOfMemory);
+        }
+    }
 }
 
 JSContext::JSContext(JSRuntime *rt)
   : ExclusiveContext(rt, &rt->mainThread, Context_JS),
     throwing(false),
-    exception(UndefinedValue()),
+    unwrappedException_(UndefinedValue()),
     options_(),
     reportGranularity(JS_DEFAULT_JITREPORT_GRANULARITY),
     resolvingList(nullptr),
@@ -1089,7 +1108,6 @@ JSContext::JSContext(JSRuntime *rt)
 #ifdef JS_THREADSAFE
     outstandingRequests(0),
 #endif
-    resolveFlags(0),
     iterValue(MagicValue(JS_NO_ITER_VALUE)),
     jitIsBroken(false),
 #ifdef MOZ_TRACE_JSCALLS
@@ -1111,20 +1129,26 @@ JSContext::~JSContext()
     JS_ASSERT(!resolvingList);
 }
 
-/*
- * Since this function is only called in the context of a pending exception,
- * the caller must subsequently take an error path. If wrapping fails, it will
- * set a new (uncatchable) exception to be used in place of the original.
- */
-void
-JSContext::wrapPendingException()
+bool
+JSContext::getPendingException(MutableHandleValue rval)
 {
-    RootedValue value(this, getPendingException());
+    JS_ASSERT(throwing);
+    rval.set(unwrappedException_);
+    if (IsAtomsCompartment(compartment()))
+        return true;
     clearPendingException();
-    if (!IsAtomsCompartment(compartment()) && compartment()->wrap(this, &value))
-        setPendingException(value);
+    if (!compartment()->wrap(this, rval))
+        return false;
+    assertSameCompartment(this, rval);
+    setPendingException(rval);
+    return true;
 }
 
+bool
+JSContext::isThrowingOutOfMemory()
+{
+    return throwing && unwrappedException_ == StringValue(names().outOfMemory);
+}
 
 void
 JSContext::enterGenerator(JSGenerator *gen)
@@ -1167,23 +1191,22 @@ JSContext::saveFrameChain()
 void
 JSContext::restoreFrameChain()
 {
+    JS_ASSERT(enterCompartmentDepth_ == 0); // We're about to clobber it, and it
+                                            // will be wrong forevermore.
     SavedFrameChain sfc = savedFrameChains_.popCopy();
     setCompartment(sfc.compartment);
     enterCompartmentDepth_ = sfc.enterCompartmentCount;
 
     if (Activation *act = mainThread().activation())
         act->restoreFrameChain();
-
-    if (isExceptionPending())
-        wrapPendingException();
 }
 
 bool
 JSContext::currentlyRunning() const
 {
     for (ActivationIterator iter(runtime()); !iter.done(); ++iter) {
-        if (iter.activation()->cx() == this) {
-            if (iter.activation()->hasSavedFrameChain())
+        if (iter->cx() == this) {
+            if (iter->hasSavedFrameChain())
                 return false;
             return true;
         }
@@ -1289,11 +1312,20 @@ JSContext::mark(JSTracer *trc)
     if (defaultCompartmentObject_)
         MarkObjectRoot(trc, &defaultCompartmentObject_, "default compartment object");
     if (isExceptionPending())
-        MarkValueRoot(trc, &exception, "exception");
+        MarkValueRoot(trc, &unwrappedException_, "unwrapped exception");
 
     TraceCycleDetectionSet(trc, cycleDetectorSet);
 
     MarkValueRoot(trc, &iterValue, "iterValue");
+}
+
+void *
+ThreadSafeContext::stackLimitAddressForJitCode(StackKind kind)
+{
+#ifdef JS_ARM_SIMULATOR
+    return runtime_->mainThread.addressOfSimulatorStackLimit();
+#endif
+    return stackLimitAddress(kind);
 }
 
 JSVersion
@@ -1339,7 +1371,7 @@ JS::AutoCheckRequestDepth::~AutoCheckRequestDepth()
 #endif
 
 #ifdef JS_CRASH_DIAGNOSTICS
-void CompartmentChecker::check(StackFrame *fp)
+void CompartmentChecker::check(InterpreterFrame *fp)
 {
     if (fp)
         check(fp->scopeChain());
@@ -1352,3 +1384,11 @@ void CompartmentChecker::check(AbstractFramePtr frame)
 }
 #endif
 
+void
+js::CrashAtUnhandlableOOM(const char *reason)
+{
+    char msgbuf[1024];
+    JS_snprintf(msgbuf, sizeof(msgbuf), "[unhandlable oom] %s", reason);
+    MOZ_ReportAssertionFailure(msgbuf, __FILE__, __LINE__);
+    MOZ_CRASH();
+}

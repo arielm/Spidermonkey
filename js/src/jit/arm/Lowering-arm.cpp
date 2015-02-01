@@ -321,7 +321,7 @@ LIRGeneratorARM::lowerModI(MMod *mod)
                 return false;
             return define(lir, mod);
         } else if (shift < 31 && (1 << (shift+1)) - 1 == rhs) {
-            LModMaskI *lir = new(alloc()) LModMaskI(useRegister(mod->lhs()), temp(LDefinition::GENERAL), shift+1);
+            LModMaskI *lir = new(alloc()) LModMaskI(useRegister(mod->lhs()), temp(), temp(), shift+1);
             if (mod->fallible() && !assignSnapshot(lir, Bailout_BaselineInfo))
                 return false;
             return define(lir, mod);
@@ -362,7 +362,7 @@ LIRGeneratorARM::newLTableSwitch(const LAllocation &in, const LDefinition &input
 LTableSwitchV *
 LIRGeneratorARM::newLTableSwitchV(MTableSwitch *tableswitch)
 {
-    return new(alloc()) LTableSwitchV(temp(), tempFloat(), tableswitch);
+    return new(alloc()) LTableSwitchV(temp(), tempDouble(), tableswitch);
 }
 
 bool
@@ -411,6 +411,9 @@ LIRGeneratorARM::visitAsmJSNeg(MAsmJSNeg *ins)
 {
     if (ins->type() == MIRType_Int32)
         return define(new(alloc()) LNegI(useRegisterAtStart(ins->input())), ins);
+
+    if(ins->type() == MIRType_Float32)
+        return define(new(alloc()) LNegF(useRegisterAtStart(ins->input())), ins);
 
     JS_ASSERT(ins->type() == MIRType_Double);
     return define(new(alloc()) LNegD(useRegisterAtStart(ins->input())), ins);
@@ -537,6 +540,12 @@ LIRGeneratorARM::lowerTruncateFToInt32(MTruncateToInt32 *ins)
 
 bool
 LIRGeneratorARM::visitStoreTypedArrayElementStatic(MStoreTypedArrayElementStatic *ins)
+{
+    MOZ_ASSUME_UNREACHABLE("NYI");
+}
+
+bool
+LIRGeneratorARM::visitForkJoinGetSlice(MForkJoinGetSlice *ins)
 {
     MOZ_ASSUME_UNREACHABLE("NYI");
 }

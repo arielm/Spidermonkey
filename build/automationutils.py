@@ -7,8 +7,10 @@ from __future__ import with_statement
 import glob, logging, os, platform, shutil, subprocess, sys, tempfile, urllib2, zipfile
 import base64
 import re
+import os
 from urlparse import urlparse
 from operator import itemgetter
+import signal
 
 try:
   import mozinfo
@@ -72,10 +74,17 @@ DEBUGGER_INFO = {
   },
 
   # valgrind doesn't explain much about leaks unless you set the
-  # '--leak-check=full' flag.
+  # '--leak-check=full' flag. But there are a lot of objects that are
+  # semi-deliberately leaked, so we set '--show-possibly-lost=no' to avoid
+  # uninteresting output from those objects. We set '--smc-check==all-non-file'
+  # and '--vex-iropt-register-updates=allregs-at-mem-access' so that valgrind
+  # deals properly with JIT'd JavaScript code.  
   "valgrind": {
     "interactive": False,
-    "args": "--leak-check=full"
+    "args": " ".join(["--leak-check=full",
+                      "--show-possibly-lost=no",
+                      "--smc-check=all-non-file",
+                      "--vex-iropt-register-updates=allregs-at-mem-access"])
   }
 }
 
@@ -147,6 +156,43 @@ def isURL(thing):
   """Return True if |thing| looks like a URL."""
   # We want to download URLs like http://... but not Windows paths like c:\...
   return len(urlparse(thing).scheme) >= 2
+
+# Python does not provide strsignal() even in the very latest 3.x.
+# This is a reasonable fake.
+def strsig(n):
+  # Signal numbers run 0 through NSIG-1; an array with NSIG members
+  # has exactly that many slots
+  _sigtbl = [None]*signal.NSIG
+  for k in dir(signal):
+    if k.startswith("SIG") and not k.startswith("SIG_") and k != "SIGCLD" and k != "SIGPOLL":
+      _sigtbl[getattr(signal, k)] = k
+  # Realtime signals mostly have no names
+  if hasattr(signal, "SIGRTMIN") and hasattr(signal, "SIGRTMAX"):
+    for r in range(signal.SIGRTMIN+1, signal.SIGRTMAX+1):
+      _sigtbl[r] = "SIGRTMIN+" + str(r - signal.SIGRTMIN)
+  # Fill in any remaining gaps
+  for i in range(signal.NSIG):
+    if _sigtbl[i] is None:
+      _sigtbl[i] = "unrecognized signal, number " + str(i)
+  if n < 0 or n >= signal.NSIG:
+    return "out-of-range signal, number "+str(n)
+  return _sigtbl[n]
+
+def printstatus(status, name = ""):
+  # 'status' is the exit status
+  if os.name != 'posix':
+    # Windows error codes are easier to look up if printed in hexadecimal
+    if status < 0:
+      status += 2**32
+    print "TEST-INFO | %s: exit status %x\n" % (name, status)
+  elif os.WIFEXITED(status):
+    print "TEST-INFO | %s: exit %d\n" % (name, os.WEXITSTATUS(status))
+  elif os.WIFSIGNALED(status):
+    # The python stdlib doesn't appear to have strsignal(), alas
+    print "TEST-INFO | {}: killed by {}".format(name,strsig(os.WTERMSIG(status)))
+  else:
+    # This is probably a can't-happen condition on Unix, but let's be defensive
+    print "TEST-INFO | %s: undecodable exit status %04x\n" % (name, status)
 
 def addCommonOptions(parser, defaults={}):
   parser.add_option("--xre-path",
@@ -448,14 +494,14 @@ def environment(xrePath, env=None, crashreporter=True, debugger=False, dmdPath=N
   else:
     env['MOZ_CRASHREPORTER_DISABLE'] = '1'
 
-  # Additional temporary logging while we try to debug some intermittent
-  # WebRTC conditions. This is necessary to troubleshoot bugs 841496,
-  # 841150, and 839677 (at least)
-  # Also (temporary) bug 870002 (mediastreamgraph)
-  env.setdefault('NSPR_LOG_MODULES', 'signaling:5,mtransport:3')
-  env['R_LOG_LEVEL'] = '5'
-  env['R_LOG_DESTINATION'] = 'stderr'
-  env['R_LOG_VERBOSE'] = '1'
+  # Crash on non-local network connections.
+  env['MOZ_DISABLE_NONLOCAL_CONNECTIONS'] = '1'
+
+  # Set WebRTC logging in case it is not set yet
+  env.setdefault('NSPR_LOG_MODULES', 'signaling:5,mtransport:5,datachannel:5')
+  env.setdefault('R_LOG_LEVEL', '6')
+  env.setdefault('R_LOG_DESTINATION', 'stderr')
+  env.setdefault('R_LOG_VERBOSE', '1')
 
   # ASan specific environment stuff
   asan = bool(mozinfo.info.get("asan"))
@@ -475,7 +521,7 @@ def environment(xrePath, env=None, crashreporter=True, debugger=False, dmdPath=N
       message = "INFO | runtests.py | ASan running in %s configuration"
       if totalMemory <= 1024 * 1024 * 4:
         message = message % 'low-memory'
-        env["ASAN_OPTIONS"] = "quarantine_size=50331648"
+        env["ASAN_OPTIONS"] = "quarantine_size=50331648:malloc_context_size=5"
       else:
         message = message % 'default memory'
     except OSError,err:
@@ -487,58 +533,38 @@ def environment(xrePath, env=None, crashreporter=True, debugger=False, dmdPath=N
 
   return env
 
-
 def dumpScreen(utilityPath):
-  """dumps the screen to the log file as a data URI"""
+  """dumps a screenshot of the entire screen to a directory specified by
+  the MOZ_UPLOAD_DIR environment variable"""
+  import mozfile
 
-  # Need to figure out what tool and whether it write to a file or stdout
+  # Need to figure out which OS-dependent tool to use
   if mozinfo.isUnix:
     utility = [os.path.join(utilityPath, "screentopng")]
-    imgoutput = 'stdout'
+    utilityname = "screentopng"
   elif mozinfo.isMac:
     utility = ['/usr/sbin/screencapture', '-C', '-x', '-t', 'png']
-    imgoutput = 'file'
+    utilityname = "screencapture"
   elif mozinfo.isWin:
     utility = [os.path.join(utilityPath, "screenshot.exe")]
-    imgoutput = 'file'
-  else:
-    log.warn("Unable to dump screen on platform '%s'", sys.platform)
+    utilityname = "screenshot"
 
-  # Run the capture correctly for the type of capture
-  kwargs = {'stdout': subprocess.PIPE}
-  if imgoutput == 'file':
-    tmpfd, imgfilename = tempfile.mkstemp(prefix='mozilla-test-fail_')
-    os.close(tmpfd)
-    utility.append(imgfilename)
-  elif imgoutput == 'stdout':
-    kwargs.update(dict(bufsize=-1, close_fds=True))
+  # Get dir where to write the screenshot file
+  parent_dir = os.environ.get('MOZ_UPLOAD_DIR', None)
+  if not parent_dir:
+    log.info('Failed to retrieve MOZ_UPLOAD_DIR env var')
+    return
+
+  # Run the capture
   try:
-    dumper = subprocess.Popen(utility, **kwargs)
+    tmpfd, imgfilename = tempfile.mkstemp(prefix='mozilla-test-fail-screenshot_', suffix='.png', dir=parent_dir)
+    os.close(tmpfd)
+    returncode = subprocess.call(utility + [imgfilename])
+    printstatus(returncode, utilityname)
   except OSError, err:
     log.info("Failed to start %s for screenshot: %s",
              utility[0], err.strerror)
     return
-
-  # Check whether the capture utility ran successfully
-  stdout, _ = dumper.communicate()
-  returncode = dumper.poll()
-  if returncode:
-    log.info("%s exited with code %d", utility, returncode)
-    return
-
-  try:
-    if imgoutput == 'stdout':
-      image = stdout
-    elif imgoutput == 'file':
-      with open(imgfilename, 'rb') as imgfile:
-        image = imgfile.read()
-  except IOError, err:
-    log.info("Failed to read image from %s", imgoutput)
-
-  encoded = base64.b64encode(image)
-  uri = "data:image/png;base64,%s" %  encoded
-  log.info("SCREENSHOT: %s", uri)
-  return uri
 
 class ShutdownLeaks(object):
   """

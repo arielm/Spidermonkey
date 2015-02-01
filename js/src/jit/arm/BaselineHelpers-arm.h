@@ -80,7 +80,7 @@ EmitChangeICReturnAddress(MacroAssembler &masm, Register reg)
 }
 
 inline void
-EmitTailCallVM(IonCode *target, MacroAssembler &masm, uint32_t argSize)
+EmitTailCallVM(JitCode *target, MacroAssembler &masm, uint32_t argSize)
 {
     // We assume during this that R0 and R1 have been pushed, and that R2 is
     // unused.
@@ -100,7 +100,7 @@ EmitTailCallVM(IonCode *target, MacroAssembler &masm, uint32_t argSize)
     // the stub calls), but the VMWrapper code being called expects the return address to also
     // be pushed on the stack.
     JS_ASSERT(BaselineTailCallReg == lr);
-    masm.makeFrameDescriptor(r0, IonFrame_BaselineJS);
+    masm.makeFrameDescriptor(r0, JitFrame_BaselineJS);
     masm.push(r0);
     masm.push(lr);
     masm.branch(target);
@@ -115,11 +115,11 @@ EmitCreateStubFrameDescriptor(MacroAssembler &masm, Register reg)
     masm.ma_add(Imm32(sizeof(void *) * 2), reg);
     masm.ma_sub(BaselineStackReg, reg);
 
-    masm.makeFrameDescriptor(reg, IonFrame_BaselineStub);
+    masm.makeFrameDescriptor(reg, JitFrame_BaselineStub);
 }
 
 inline void
-EmitCallVM(IonCode *target, MacroAssembler &masm)
+EmitCallVM(JitCode *target, MacroAssembler &masm)
 {
     EmitCreateStubFrameDescriptor(masm, r0);
     masm.push(r0);
@@ -146,7 +146,7 @@ EmitEnterStubFrame(MacroAssembler &masm, Register scratch)
     // if needed.
 
     // Push frame descriptor and return address.
-    masm.makeFrameDescriptor(scratch, IonFrame_BaselineJS);
+    masm.makeFrameDescriptor(scratch, JitFrame_BaselineJS);
     masm.push(scratch);
     masm.push(BaselineTailCallReg);
 
@@ -160,7 +160,7 @@ EmitEnterStubFrame(MacroAssembler &masm, Register scratch)
 }
 
 inline void
-EmitLeaveStubFrame(MacroAssembler &masm, bool calledIntoIon = false)
+EmitLeaveStubFrameHead(MacroAssembler &masm, bool calledIntoIon = false)
 {
     // Ion frames do not save and restore the frame pointer. If we called
     // into Ion, we have to restore the stack pointer from the frame descriptor.
@@ -173,7 +173,11 @@ EmitLeaveStubFrame(MacroAssembler &masm, bool calledIntoIon = false)
     } else {
         masm.mov(BaselineFrameReg, BaselineStackReg);
     }
+}
 
+inline void
+EmitLeaveStubFrameCommonTail(MacroAssembler &masm)
+{
     masm.pop(BaselineFrameReg);
     masm.pop(BaselineStubReg);
 
@@ -182,6 +186,13 @@ EmitLeaveStubFrame(MacroAssembler &masm, bool calledIntoIon = false)
 
     // Discard the frame descriptor.
     masm.pop(ScratchRegister);
+}
+
+inline void
+EmitLeaveStubFrame(MacroAssembler &masm, bool calledIntoIon = false)
+{
+    EmitLeaveStubFrameHead(masm, calledIntoIon);
+    EmitLeaveStubFrameCommonTail(masm);
 }
 
 inline void
@@ -226,7 +237,7 @@ EmitUnstowICValues(MacroAssembler &masm, int values, bool discard = false)
 }
 
 inline void
-EmitCallTypeUpdateIC(MacroAssembler &masm, IonCode *code, uint32_t objectOffset)
+EmitCallTypeUpdateIC(MacroAssembler &masm, JitCode *code, uint32_t objectOffset)
 {
     JS_ASSERT(R2 == ValueOperand(r1, r0));
 

@@ -28,7 +28,6 @@ enum Phase {
     PHASE_PURGE,
     PHASE_MARK,
     PHASE_MARK_ROOTS,
-    PHASE_MARK_TYPES,
     PHASE_MARK_DELAYED,
     PHASE_SWEEP,
     PHASE_SWEEP_MARK,
@@ -53,12 +52,11 @@ enum Phase {
     PHASE_DISCARD_TI,
     PHASE_FREE_TI_ARENA,
     PHASE_SWEEP_TYPES,
-    PHASE_CLEAR_SCRIPT_ANALYSIS,
     PHASE_SWEEP_OBJECT,
     PHASE_SWEEP_STRING,
     PHASE_SWEEP_SCRIPT,
     PHASE_SWEEP_SHAPE,
-    PHASE_SWEEP_IONCODE,
+    PHASE_SWEEP_JITCODE,
     PHASE_FINALIZE_END,
     PHASE_DESTROY,
     PHASE_GC_END,
@@ -69,6 +67,7 @@ enum Phase {
 enum Stat {
     STAT_NEW_CHUNK,
     STAT_DESTROY_CHUNK,
+    STAT_MINOR_GC,
 
     STAT_LIMIT
 };
@@ -248,6 +247,8 @@ struct AutoSCC
     int64_t start;
     MOZ_DECL_USE_GUARD_OBJECT_NOTIFIER
 };
+
+const char *ExplainReason(JS::gcreason::Reason reason);
 
 } /* namespace gcstats */
 } /* namespace js */

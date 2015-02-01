@@ -397,7 +397,7 @@ IntlInitialize(JSContext *cx, HandleObject obj, Handle<PropertyName*> initialize
                HandleValue locales, HandleValue options)
 {
     RootedValue initializerValue(cx);
-    if (!cx->global()->getIntrinsicValue(cx, initializer, &initializerValue))
+    if (!GlobalObject::getIntrinsicValue(cx, cx->global(), initializer, &initializerValue))
         return false;
     JS_ASSERT(initializerValue.isObject());
     JS_ASSERT(initializerValue.toObject().is<JSFunction>());
@@ -463,7 +463,7 @@ static bool
 GetInternals(JSContext *cx, HandleObject obj, MutableHandleObject internals)
 {
     RootedValue getInternalsValue(cx);
-    if (!cx->global()->getIntrinsicValue(cx, cx->names().getInternals, &getInternalsValue))
+    if (!GlobalObject::getIntrinsicValue(cx, cx->global(), cx->names().getInternals, &getInternalsValue))
         return false;
     JS_ASSERT(getInternalsValue.isObject());
     JS_ASSERT(getInternalsValue.toObject().is<JSFunction>());
@@ -563,7 +563,8 @@ static const Class CollatorClass = {
 static bool
 collator_toSource(JSContext *cx, unsigned argc, Value *vp)
 {
-    vp->setString(cx->names().Collator);
+    CallArgs args = CallArgsFromVp(argc, vp);
+    args.rval().setString(cx->names().Collator);
     return true;
 }
 #endif
@@ -690,10 +691,9 @@ InitCollatorClass(JSContext *cx, HandleObject Intl, Handle<GlobalObject*> global
      * passing to methods like Array.prototype.sort).
      */
     RootedValue getter(cx);
-    if (!cx->global()->getIntrinsicValue(cx, cx->names().CollatorCompareGet, &getter))
+    if (!GlobalObject::getIntrinsicValue(cx, cx->global(), cx->names().CollatorCompareGet, &getter))
         return nullptr;
-    RootedValue undefinedValue(cx, UndefinedValue());
-    if (!JSObject::defineProperty(cx, proto, cx->names().compare, undefinedValue,
+    if (!JSObject::defineProperty(cx, proto, cx->names().compare, UndefinedHandleValue,
                                   JS_DATA_TO_FUNC_PTR(JSPropertyOp, &getter.toObject()),
                                   nullptr, JSPROP_GETTER))
     {
@@ -701,10 +701,11 @@ InitCollatorClass(JSContext *cx, HandleObject Intl, Handle<GlobalObject*> global
     }
 
     // 10.2.1 and 10.3
-    RootedValue locales(cx, UndefinedValue());
-    RootedValue options(cx, UndefinedValue());
-    if (!IntlInitialize(cx, proto, cx->names().InitializeCollator, locales, options))
+    if (!IntlInitialize(cx, proto, cx->names().InitializeCollator, UndefinedHandleValue,
+                        UndefinedHandleValue))
+    {
         return nullptr;
+    }
 
     // 8.1
     RootedValue ctorValue(cx, ObjectValue(*ctor));
@@ -1049,7 +1050,8 @@ static const Class NumberFormatClass = {
 static bool
 numberFormat_toSource(JSContext *cx, unsigned argc, Value *vp)
 {
-    vp->setString(cx->names().NumberFormat);
+    CallArgs args = CallArgsFromVp(argc, vp);
+    args.rval().setString(cx->names().NumberFormat);
     return true;
 }
 #endif
@@ -1178,10 +1180,9 @@ InitNumberFormatClass(JSContext *cx, HandleObject Intl, Handle<GlobalObject*> gl
      * for passing to methods like Array.prototype.map).
      */
     RootedValue getter(cx);
-    if (!cx->global()->getIntrinsicValue(cx, cx->names().NumberFormatFormatGet, &getter))
+    if (!GlobalObject::getIntrinsicValue(cx, cx->global(), cx->names().NumberFormatFormatGet, &getter))
         return nullptr;
-    RootedValue undefinedValue(cx, UndefinedValue());
-    if (!JSObject::defineProperty(cx, proto, cx->names().format, undefinedValue,
+    if (!JSObject::defineProperty(cx, proto, cx->names().format, UndefinedHandleValue,
                                   JS_DATA_TO_FUNC_PTR(JSPropertyOp, &getter.toObject()),
                                   nullptr, JSPROP_GETTER))
     {
@@ -1189,10 +1190,11 @@ InitNumberFormatClass(JSContext *cx, HandleObject Intl, Handle<GlobalObject*> gl
     }
 
     // 11.2.1 and 11.3
-    RootedValue locales(cx, UndefinedValue());
-    RootedValue options(cx, UndefinedValue());
-    if (!IntlInitialize(cx, proto, cx->names().InitializeNumberFormat, locales, options))
+    if (!IntlInitialize(cx, proto, cx->names().InitializeNumberFormat, UndefinedHandleValue,
+                        UndefinedHandleValue))
+    {
         return nullptr;
+    }
 
     // 8.1
     RootedValue ctorValue(cx, ObjectValue(*ctor));
@@ -1288,7 +1290,6 @@ NewUNumberFormat(JSContext *cx, HandleObject numberFormat)
     bool uUseGrouping = true;
 
     // Sprinkle appropriate rooting flavor over things the GC might care about.
-    SkipRoot skip(cx, &uCurrency);
     RootedString currency(cx);
 
     // We don't need to look at numberingSystem - it can only be set via
@@ -1507,7 +1508,8 @@ static const Class DateTimeFormatClass = {
 static bool
 dateTimeFormat_toSource(JSContext *cx, unsigned argc, Value *vp)
 {
-    vp->setString(cx->names().DateTimeFormat);
+    CallArgs args = CallArgsFromVp(argc, vp);
+    args.rval().setString(cx->names().DateTimeFormat);
     return true;
 }
 #endif
@@ -1635,10 +1637,9 @@ InitDateTimeFormatClass(JSContext *cx, HandleObject Intl, Handle<GlobalObject*> 
      * (suitable for passing to methods like Array.prototype.map).
      */
     RootedValue getter(cx);
-    if (!cx->global()->getIntrinsicValue(cx, cx->names().DateTimeFormatFormatGet, &getter))
+    if (!GlobalObject::getIntrinsicValue(cx, cx->global(), cx->names().DateTimeFormatFormatGet, &getter))
         return nullptr;
-    RootedValue undefinedValue(cx, UndefinedValue());
-    if (!JSObject::defineProperty(cx, proto, cx->names().format, undefinedValue,
+    if (!JSObject::defineProperty(cx, proto, cx->names().format, UndefinedHandleValue,
                                   JS_DATA_TO_FUNC_PTR(JSPropertyOp, &getter.toObject()),
                                   nullptr, JSPROP_GETTER))
     {
@@ -1646,10 +1647,11 @@ InitDateTimeFormatClass(JSContext *cx, HandleObject Intl, Handle<GlobalObject*> 
     }
 
     // 12.2.1 and 12.3
-    RootedValue locales(cx, UndefinedValue());
-    RootedValue options(cx, UndefinedValue());
-    if (!IntlInitialize(cx, proto, cx->names().InitializeDateTimeFormat, locales, options))
+    if (!IntlInitialize(cx, proto, cx->names().InitializeDateTimeFormat, UndefinedHandleValue,
+                        UndefinedHandleValue))
+    {
         return nullptr;
+    }
 
     // 8.1
     RootedValue ctorValue(cx, ObjectValue(*ctor));
@@ -1780,7 +1782,6 @@ js::intl_patternForSkeleton(JSContext *cx, unsigned argc, Value *vp)
     const jschar *skeleton = JS_GetStringCharsZ(cx, jsskeleton);
     if (!skeleton)
         return false;
-    SkipRoot skip(cx, &skeleton);
     uint32_t skeletonLen = u_strlen(JSCharToUChar(skeleton));
 
     UErrorCode status = U_ZERO_ERROR;
@@ -1841,9 +1842,6 @@ NewUDateFormat(JSContext *cx, HandleObject dateTimeFormat)
     uint32_t uTimeZoneLength = 0;
     const UChar *uPattern = nullptr;
     uint32_t uPatternLength = 0;
-
-    SkipRoot skipTimeZone(cx, &uTimeZone);
-    SkipRoot skipPattern(cx, &uPattern);
 
     // We don't need to look at calendar and numberingSystem - they can only be
     // set via the Unicode locale extension and are therefore already set on
@@ -1990,7 +1988,8 @@ const Class js::IntlClass = {
 static bool
 intl_toSource(JSContext *cx, unsigned argc, Value *vp)
 {
-    vp->setString(cx->names().Intl);
+    CallArgs args = CallArgsFromVp(argc, vp);
+    args.rval().setString(cx->names().Intl);
     return true;
 }
 #endif

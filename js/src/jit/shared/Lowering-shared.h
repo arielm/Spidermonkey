@@ -31,6 +31,7 @@ class LIRGeneratorShared : public MInstructionVisitorWithDefaults
     LIRGraph &lirGraph_;
     LBlock *current;
     MResumePoint *lastResumePoint_;
+    LRecoverInfo *cachedRecoverInfo_;
     LOsiPoint *osiPoint_;
 
   public:
@@ -39,6 +40,7 @@ class LIRGeneratorShared : public MInstructionVisitorWithDefaults
         graph(graph),
         lirGraph_(lirGraph),
         lastResumePoint_(nullptr),
+        cachedRecoverInfo_(nullptr),
         osiPoint_(nullptr)
     { }
 
@@ -104,7 +106,8 @@ class LIRGeneratorShared : public MInstructionVisitorWithDefaults
     // These create temporary register requests.
     inline LDefinition temp(LDefinition::Type type = LDefinition::GENERAL,
                             LDefinition::Policy policy = LDefinition::DEFAULT);
-    inline LDefinition tempFloat();
+    inline LDefinition tempFloat32();
+    inline LDefinition tempDouble();
     inline LDefinition tempCopy(MDefinition *input, uint32_t reusedInput);
 
     // Note that the fixed register has a GENERAL type.
@@ -159,6 +162,7 @@ class LIRGeneratorShared : public MInstructionVisitorWithDefaults
         return tmp;
     }
 
+    LRecoverInfo *getRecoverInfo(MResumePoint *rp);
     LSnapshot *buildSnapshot(LInstruction *ins, MResumePoint *rp, BailoutKind kind);
     bool assignPostSnapshot(MInstruction *mir, LInstruction *ins);
 
@@ -189,6 +193,11 @@ class LIRGeneratorShared : public MInstructionVisitorWithDefaults
      // Whether we can emit Float32 specific optimizations.
     static bool allowFloat32Optimizations() {
        return false;
+    }
+
+    // Whether we can inline ForkJoinGetSlice.
+    static bool allowInlineForkJoinGetSlice() {
+        return false;
     }
 };
 
