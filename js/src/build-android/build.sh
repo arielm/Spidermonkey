@@ -28,7 +28,7 @@ rm -rf .deps
     --target=${TARGET} \
     --enable-android-libstdcxx \
     --disable-shared-js --disable-tests --without-intl-api \
-    --disable-debug --enable-strip --enable-install-strip \
+    --disable-debug --disable-debug-symbols --enable-strip --enable-install-strip \
     --disable-threadsafe \
     --enable-exact-rooting --enable-gcgenerational
  
