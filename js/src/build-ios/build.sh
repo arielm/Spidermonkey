@@ -14,12 +14,12 @@ ls | grep -v build.sh | xargs rm -rf
 rm -rf .deps
 
 ../configure --with-ios-target=iPhoneOS --with-ios-version=$IOS_SDK --with-ios-min-version=$MIN_IOS_VERSION --with-ios-arch=armv7 \
-    --disable-shared-js --disable-tests --without-intl-api --enable-llvm-hacks \
-    --disable-threadsafe \
-    --disable-root-analysis --disable-exact-rooting --enable-gcincremental \
+    --disable-tests --disable-shared-js --without-intl-api --enable-llvm-hacks \
     --disable-ion --disable-jm --disable-tm --disable-methodjit --disable-monoic --disable-polyic --disable-yarr-jit \
     --enable-optimize=-O3 --with-thumb=yes \
-    --disable-debug --disable-debug-symbols --enable-strip --enable-install-strip
+    --disable-debug --disable-debug-symbols --enable-strip --enable-install-strip \
+    --disable-threadsafe \
+    --enable-exact-rooting --enable-gcgenerational
 
 make -j$cpus
 
@@ -37,12 +37,12 @@ ls | grep -v libjs_static.armv7.a | grep -v build.sh | xargs rm -rf
 rm -rf .deps
 
 ../configure --with-ios-target=iPhoneOS --with-ios-version=$IOS_SDK --with-ios-min-version=$MIN_IOS_VERSION --with-ios-arch=arm64 \
-    --disable-shared-js --disable-tests --without-intl-api --enable-llvm-hacks \
-    --disable-threadsafe \
-    --disable-root-analysis --disable-exact-rooting --enable-gcincremental \
+    --disable-tests --disable-shared-js --without-intl-api --enable-llvm-hacks \
     --disable-ion --disable-jm --disable-tm --disable-methodjit --disable-monoic --disable-polyic --disable-yarr-jit \
     --enable-optimize=-O3 --with-thumb=yes \
-    --disable-debug --disable-debug-symbols --enable-strip --enable-install-strip
+    --disable-debug --disable-debug-symbols --enable-strip --enable-install-strip \
+    --disable-threadsafe \
+    --enable-exact-rooting --enable-gcgenerational
 
 make -j$cpus
 
@@ -64,7 +64,7 @@ $LIPO -info libjs_static.a
 
 if [ -z $RELEASE_DIR ]; then
     echo "RELEASE_DIR MUST BE DEFINED!"
-    echo "e.g. export RELEASE_DIR=../../../blocks/Spidermonkey25"
+    echo "e.g. export RELEASE_DIR=../../../blocks/Spidermonkey31"
     exit -1  
 fi
 
