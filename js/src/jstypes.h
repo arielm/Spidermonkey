@@ -155,8 +155,10 @@
 # endif
 #elif defined(__HP_cc) || defined(__HP_aCC)       /* HP-UX cc/aCC */
 # if defined(__LP64__)
-#  define JS_64BIT
+#  define JS_64BIT 
 # endif
+#elif defined(__x86_64__) || defined(__arm64__)
+#  define JS_64BIT
 #else
 # error "Implement me"
 #endif
